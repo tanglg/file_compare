@@ -10,3 +10,4 @@ release/PDF雷同性检测工具_1.0.0_aarch64.dmg
 release/~$F雷同性检测工具_用户手册.docx
 docs/build_user_manual.py
 CLAUDE.md
+.playwright-mcp/

@@ -115,6 +115,8 @@ pub struct AnalysisProgress {
     pub total_files: usize,
     pub processed_pages: usize,
     pub total_pages: usize,
+    pub indexed_chunks: usize,
+    pub indexed_images: usize,
     pub cache_hits: usize,
     pub candidate_pairs: usize,
     pub confirmed_pairs: usize,
@@ -138,6 +140,8 @@ impl AnalysisProgress {
             total_files,
             processed_pages: 0,
             total_pages: 0,
+            indexed_chunks: 0,
+            indexed_images: 0,
             cache_hits: 0,
             candidate_pairs: 0,
             confirmed_pairs: 0,
@@ -385,6 +389,8 @@ pub fn run_analysis(
             Ok(doc) => {
                 progress.processed_files += 1;
                 progress.processed_pages += doc.summary.page_count;
+                progress.indexed_chunks += doc.summary.chunk_count;
+                progress.indexed_images += doc.summary.indexed_image_count;
                 warnings.extend(
                     doc.extraction_warnings
                         .iter()

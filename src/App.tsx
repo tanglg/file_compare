@@ -34,6 +34,8 @@ type AnalysisProgress = {
   total_files: number;
   processed_pages: number;
   total_pages: number;
+  indexed_chunks: number;
+  indexed_images: number;
   cache_hits: number;
   candidate_pairs: number;
   confirmed_pairs: number;
@@ -413,13 +415,15 @@ export function App() {
       try {
         const next = await invoke<AnalysisProgress>("get_analysis_progress", { taskId });
         if (disposed) return;
-        setProgress(next);
         if (["Done", "Cancelled", "Failed"].includes(next.stage)) {
           const finalResult = await invoke<AnalysisResult>("get_analysis_result", { taskId });
           if (disposed) return;
+          setProgress(next);
           setResult(finalResult);
           setSelectedGroupId(finalResult.groups[0]?.group_id ?? null);
           setSelectedPairId(finalResult.pairs[0]?.pair_id ?? null);
+        } else {
+          setProgress(next);
         }
       } catch (cause) {
         if (disposed) return;
@@ -718,8 +722,8 @@ export function App() {
 
             <section className="panel index-card">
               <PanelHeading title="索引召回概览" action="全局索引" />
-              <IndexRow color="blue" label="文本指纹" value={number(totalChunks)} width={result ? 84 : 0} />
-              <IndexRow color="green" label="图片指纹" value={number(indexedImages)} width={result ? 56 : 0} />
+              <IndexRow color="blue" label="文本指纹" value={number(result ? totalChunks : (progress?.indexed_chunks ?? 0))} width={(result || progress?.indexed_chunks) ? 84 : 0} />
+              <IndexRow color="green" label="图片指纹" value={number(result ? indexedImages : (progress?.indexed_images ?? 0))} width={(result || progress?.indexed_images) ? 56 : 0} />
               <IndexRow color="amber" label="处理页面" value={number(progress?.total_pages ?? 0)} width={progress ? 72 : 0} />
               <IndexRow color="purple" label="候选召回" value={`${progress?.candidate_pairs ?? 0} 对`} width={progress ? 66 : 0} />
               <div className="index-note">已扫描 {number(totalImages)} 个图片对象；小图标会过滤，公共 Logo 会降噪。</div>
