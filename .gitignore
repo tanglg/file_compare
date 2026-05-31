@@ -1,0 +1,11 @@
+.DS_Store
+node_modules/
+dist/
+src-tauri/target/
+analysis_results/
+demo_files/
+PDF雷同性检测工具_Tauri技术方案.docx
+release/PDF雷同性检测工具_用户手册.docx
+release/PDF雷同性检测工具_1.0.0_aarch64.dmg
+release/~$F雷同性检测工具_用户手册.docx
+docs/build_user_manual.py
