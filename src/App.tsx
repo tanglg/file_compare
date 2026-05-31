@@ -53,6 +53,7 @@ type FileSummary = {
   total_text_chars: number;
   chunk_count: number;
   image_count: number;
+  indexed_image_count: number;
   status: string;
   error?: string | null;
 };
@@ -64,6 +65,16 @@ type MatchedText = {
   text_readable: boolean;
   left_text: string;
   right_text: string;
+};
+
+type MatchedImage = {
+  left_page: number;
+  right_page: number;
+  hamming_distance: number;
+  similarity: number;
+  exact: boolean;
+  width: number;
+  height: number;
 };
 
 type SimilarityPair = {
@@ -79,6 +90,7 @@ type SimilarityPair = {
   approximate_text_match_count: number;
   matched_text_chars: number;
   matched_texts: MatchedText[];
+  matched_images: MatchedImage[];
 };
 
 type PairRelation = {
@@ -200,10 +212,10 @@ const stageLabels: Record<AnalysisStage, string> = {
 };
 
 const pipeline = [
-  ["快速扫描", "逐页抽取文本与文档元数据"],
-  ["全局索引", "文本 shingle 倒排索引"],
-  ["候选召回", "模板降噪与候选截断"],
-  ["候选精算", "精确页与近似文本覆盖"],
+  ["快速扫描", "逐页抽取文本与内嵌图片"],
+  ["全局索引", "文本 shingle 与图片指纹"],
+  ["候选召回", "文本、图片候选合并与降噪"],
+  ["候选精算", "文本覆盖与图片一对一匹配"],
   ["图聚类", "输出雷同组"],
 ];
 
@@ -260,6 +272,7 @@ function statusLabel(status: string) {
     {
       ready: "已索引",
       "cid-fallback": "CID 指纹",
+      "image-only": "仅图片",
       failed: "失败",
       "text-empty": "文本较少",
     }[status] ?? status
@@ -323,8 +336,10 @@ export function App() {
     sortedPairs[0];
   const totalChunks = files.reduce((sum, file) => sum + file.chunk_count, 0);
   const totalImages = files.reduce((sum, file) => sum + file.image_count, 0);
+  const indexedImages = files.reduce((sum, file) => sum + file.indexed_image_count, 0);
   const totalEvidence = sortedPairs.reduce(
-    (sum, pair) => sum + pair.exact_page_match_count + pair.approximate_text_match_count,
+    (sum, pair) =>
+      sum + pair.exact_page_match_count + pair.approximate_text_match_count + pair.matched_images.length,
     0,
   );
   const currentStep = activePipelineStep(progress);
@@ -438,7 +453,7 @@ export function App() {
           <span className="badge good">文本引擎已启用</span>
           <span className="badge good">权限正常</span>
           <span className="badge blue">本地处理</span>
-          <span className="badge muted">图片检测未启用</span>
+          <span className="badge good">图片指纹已启用</span>
           <button className="button" onClick={selectFiles}>
             <Plus size={15} />
             导入 PDF
@@ -500,6 +515,7 @@ export function App() {
             </div>
             <div className="settings-grid">
               <ParameterInput label="文本确认阈值" value={analysisConfig.text_threshold} step={0.01} min={0.4} max={0.95} onChange={(value) => setAnalysisConfig({ ...analysisConfig, text_threshold: value })} />
+              <ParameterInput label="图片确认阈值" value={analysisConfig.image_threshold} step={0.01} min={0.6} max={0.95} onChange={(value) => setAnalysisConfig({ ...analysisConfig, image_threshold: value })} />
               <ParameterInput label="成组阈值" value={finalThreshold} step={0.01} min={0.3} max={0.95} onChange={(value) => setFinalThreshold(value)} />
               <ParameterInput label="目标块长度" value={analysisConfig.target_chunk_chars} step={20} min={200} max={1000} onChange={(value) => setAnalysisConfig({ ...analysisConfig, target_chunk_chars: value })} />
               <ParameterInput label="块重叠字符" value={analysisConfig.chunk_overlap_chars} step={10} min={20} max={300} onChange={(value) => setAnalysisConfig({ ...analysisConfig, chunk_overlap_chars: value })} />
@@ -567,7 +583,7 @@ export function App() {
                     <div className="file-metrics">
                       <Metric value={number(file.page_count)} label="页" />
                       <Metric value={chars(file.total_text_chars)} label="字" />
-                      <Metric value={number(file.image_count)} label="图*" />
+                      <Metric value={number(file.indexed_image_count)} label="有效图" />
                     </div>
                   ) : (
                     <p className="path">{path}</p>
@@ -609,10 +625,10 @@ export function App() {
             <section className="panel index-card">
               <PanelHeading title="索引召回概览" action="全局索引" />
               <IndexRow color="blue" label="文本指纹" value={number(totalChunks)} width={result ? 84 : 0} />
-              <IndexRow color="green" label="图片对象*" value={number(totalImages)} width={result ? 56 : 0} />
+              <IndexRow color="green" label="图片指纹" value={number(indexedImages)} width={result ? 56 : 0} />
               <IndexRow color="amber" label="处理页面" value={number(progress?.total_pages ?? 0)} width={progress ? 72 : 0} />
               <IndexRow color="purple" label="候选召回" value={`${progress?.candidate_pairs ?? 0} 对`} width={progress ? 66 : 0} />
-              <div className="index-note">* 图片当前仅统计对象数量，不参与雷同结论。</div>
+              <div className="index-note">已扫描 {number(totalImages)} 个图片对象；小图标会过滤，公共 Logo 会降噪。</div>
             </section>
           </div>
 
@@ -681,7 +697,7 @@ export function App() {
                         <span>{compactName(pair.left_file, 7)} ↔ {compactName(pair.right_file, 7)}</span>
                         <b>{score(pair.final_score)}</b>
                         <span>{score(pair.text_score)}</span>
-                        <span>--</span>
+                        <span>{score(pair.image_score)}</span>
                         <span>--</span>
                         <em>已确认</em>
                       </button>
@@ -715,7 +731,7 @@ export function App() {
               label="近似片段"
               value={selectedPair ? `${number(selectedPair.approximate_text_match_count)} 处` : "--"}
             />
-            <SummaryRow label="图片证据" value="未启用" />
+            <SummaryRow label="图片证据" value={selectedPair ? `${number(selectedPair.matched_images.length)} 张` : "--"} />
           </RightPanel>
 
           <RightPanel title="代表雷同文本" action={selectedPair ? "文件对证据" : "等待选择"}>
@@ -749,10 +765,35 @@ export function App() {
             )}
           </RightPanel>
 
-          <RightPanel title="能力提示" action="文本版">
+          <RightPanel title="代表雷同图片" action={selectedPair?.matched_images[0] ? "图片证据" : "等待选择"}>
+            {selectedPair?.matched_images[0] ? (
+              <>
+                <SummaryRow
+                  label="出现位置"
+                  value={`A P${selectedPair.matched_images[0].left_page} / B P${selectedPair.matched_images[0].right_page}`}
+                />
+                <SummaryRow
+                  label="证据类型"
+                  value={selectedPair.matched_images[0].exact ? "完全重复" : "近似重复"}
+                />
+                <SummaryRow
+                  label="pHash 距离"
+                  value={number(selectedPair.matched_images[0].hamming_distance)}
+                />
+                <SummaryRow
+                  label="有效尺寸"
+                  value={`${selectedPair.matched_images[0].width} × ${selectedPair.matched_images[0].height}`}
+                />
+              </>
+            ) : (
+              <Empty copy="当前关系没有图片证据。" />
+            )}
+          </RightPanel>
+
+          <RightPanel title="能力提示" action="内嵌图片版">
             <div className="warning-box">
               <AlertTriangle size={15} />
-              图片 pHash、扫描件页面渲染、OCR 和 SQLite 缓存尚未接入。本版本结果仅代表文本雷同性。
+              内嵌图片 SHA-256 与 pHash 已启用。扫描件页面渲染、OCR 和 SQLite 缓存尚未接入。
             </div>
           </RightPanel>
 

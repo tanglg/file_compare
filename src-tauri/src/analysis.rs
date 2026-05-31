@@ -1,7 +1,10 @@
 use chrono::Utc;
+use image::imageops::FilterType;
+use image::GrayImage;
 use lopdf::content::Content;
-use lopdf::{Document, Object};
+use lopdf::{Dictionary, Document, Object, ObjectId, Stream};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
@@ -25,6 +28,11 @@ const CANDIDATE_TOP_K_PER_FILE: usize = 20;
 const CANDIDATE_MIN_CHUNK_PAIRS: usize = 2;
 const CANDIDATE_STRONG_SINGLE_CHUNK_SHINGLES: u32 = 16;
 const CID_FINGERPRINT_BASE: u32 = 0xF0000;
+const MIN_IMAGE_DIMENSION: u32 = 48;
+const MIN_IMAGE_AREA: u64 = 4_096;
+const LARGE_SINGLE_IMAGE_AREA: u64 = 100_000;
+const MAX_IMAGE_POSTINGS: usize = 160;
+const MAX_IMAGE_MATCHES_PER_PAIR: usize = 30;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AnalyzeRequest {
@@ -71,6 +79,7 @@ impl AnalyzeRequest {
             return Err("请至少选择 2 个 PDF 文件。".to_string());
         }
         if !(0.0..=1.0).contains(&self.text_threshold)
+            || !(0.0..=1.0).contains(&self.image_threshold)
             || !(0.0..=1.0).contains(&self.final_threshold)
         {
             return Err("相似度阈值必须位于 0 到 1 之间。".to_string());
@@ -189,6 +198,7 @@ pub struct FileSummary {
     pub total_text_chars: usize,
     pub chunk_count: usize,
     pub image_count: usize,
+    pub indexed_image_count: usize,
     pub status: String,
     pub error: Option<String>,
 }
@@ -225,6 +235,10 @@ pub struct MatchedImage {
     pub left_page: usize,
     pub right_page: usize,
     pub hamming_distance: u32,
+    pub similarity: f32,
+    pub exact: bool,
+    pub width: u32,
+    pub height: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -274,6 +288,7 @@ struct PdfDocumentData {
     summary: FileSummary,
     pages: Vec<PageText>,
     chunks: Vec<TextChunk>,
+    images: Vec<PdfImage>,
     extraction_warnings: Vec<String>,
 }
 
@@ -297,10 +312,26 @@ struct TextChunk {
     simhash: u64,
 }
 
+#[derive(Clone)]
+struct PdfImage {
+    page: usize,
+    width: u32,
+    height: u32,
+    area: u64,
+    sha256: [u8; 32],
+    phash: Option<u64>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct ChunkRef {
     file_index: usize,
     chunk_index: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct ImageRef {
+    file_index: usize,
+    image_index: usize,
 }
 
 pub fn run_analysis(
@@ -313,11 +344,12 @@ pub fn run_analysis(
     let timer = Instant::now();
     let mut progress = AnalysisProgress::new(task_id.clone(), request.paths.len());
     let mut docs = Vec::new();
-    let mut warnings =
-        vec!["当前版本仅启用文本检测；图片 pHash、扫描件页面渲染和 OCR 尚未启用。".to_string()];
+    let mut warnings = vec![
+        "已启用 PDF 内嵌图片 SHA-256 与 pHash 检测；扫描件页面渲染和 OCR 尚未启用。".to_string(),
+    ];
 
     progress.stage = AnalysisStage::ReadingMeta;
-    progress.message = "正在逐页读取 PDF 文本。".to_string();
+    progress.message = "正在逐页读取 PDF 文本与内嵌图片。".to_string();
     update_progress(&mut progress, timer, &on_progress);
 
     for (file_index, path) in request.paths.iter().enumerate() {
@@ -363,11 +395,13 @@ pub fn run_analysis(
                         total_text_chars: 0,
                         chunk_count: 0,
                         image_count: 0,
+                        indexed_image_count: 0,
                         status: "failed".to_string(),
                         error: Some(error),
                     },
                     pages: Vec::new(),
                     chunks: Vec::new(),
+                    images: Vec::new(),
                     extraction_warnings: Vec::new(),
                 });
             }
@@ -378,19 +412,32 @@ pub fn run_analysis(
     progress.stage = AnalysisStage::BuildingTextIndex;
     progress.current_file = None;
     progress.current_page = None;
-    progress.message = "正在建立 shingle 倒排索引。".to_string();
+    progress.message = "正在建立文本与图片倒排索引。".to_string();
     update_progress(&mut progress, timer, &on_progress);
 
-    let (candidate_scores, chunk_pair_features) = build_text_index(&docs, &request);
+    let (mut candidate_scores, chunk_pair_features) = build_text_index(&docs, &request);
+    let (image_candidate_scores, common_image_hashes) = build_image_index(&docs, &request);
+    for (pair, score) in image_candidate_scores {
+        candidate_scores
+            .entry(pair)
+            .and_modify(|current| *current = current.max(score))
+            .or_insert(score);
+    }
     progress.candidate_pairs = candidate_scores.len();
     progress.message = format!("已召回 {} 个候选文件对。", progress.candidate_pairs);
     update_progress(&mut progress, timer, &on_progress);
 
     progress.stage = AnalysisStage::ComparingText;
-    progress.message = "正在对候选文件对进行文本精算。".to_string();
+    progress.message = "正在对候选文件对进行文本与图片精算。".to_string();
     update_progress(&mut progress, timer, &on_progress);
 
-    let mut pairs = compare_candidates(&docs, &request, &candidate_scores, &chunk_pair_features);
+    let mut pairs = compare_candidates(
+        &docs,
+        &request,
+        &candidate_scores,
+        &chunk_pair_features,
+        &common_image_hashes,
+    );
     pairs.sort_by(|left, right| {
         right
             .final_score
@@ -399,6 +446,7 @@ pub fn run_analysis(
     });
     progress.confirmed_pairs = pairs.len();
     progress.confirmed_text_matches = pairs.iter().map(|pair| pair.matched_texts.len()).sum();
+    progress.confirmed_image_matches = pairs.iter().map(|pair| pair.matched_images.len()).sum();
     update_progress(&mut progress, timer, &on_progress);
 
     progress.stage = AnalysisStage::GeneratingReport;
@@ -465,12 +513,14 @@ fn extract_pdf(
     progress.message = format!("正在读取 {}，共 {} 页。", file_name(path), page_count);
     update_progress(progress, timer, on_progress);
 
-    let image_count = count_images(&document);
     let mut raw_pages = Vec::with_capacity(page_count);
+    let mut images = Vec::new();
+    let mut image_count = 0usize;
+    let mut image_decode_failures = 0usize;
     let mut used_cid_fallback = false;
     let mut extraction_errors = Vec::new();
 
-    for (page_offset, page_number) in pages.keys().enumerate() {
+    for (page_offset, (page_number, page_id)) in pages.iter().enumerate() {
         if should_cancel() {
             break;
         }
@@ -481,6 +531,11 @@ fn extract_pdf(
             progress.message = format!("正在读取 {} 第 {} 页。", file_name(path), page);
             update_progress(progress, timer, on_progress);
         }
+
+        let page_images = extract_page_images(&document, *page_id, page);
+        image_count += page_images.discovered;
+        image_decode_failures += page_images.decode_failures;
+        images.extend(page_images.images);
 
         let raw_text = match document.extract_text(&[*page_number]) {
             Ok(text) => text,
@@ -515,7 +570,10 @@ fn extract_pdf(
         .flat_map(|page| chunk_text(&page.text, page.page, request))
         .collect::<Vec<_>>();
 
-    let status = if total_text_chars == 0 {
+    let indexed_image_count = images.len();
+    let status = if total_text_chars == 0 && indexed_image_count > 0 {
+        "image-only"
+    } else if total_text_chars == 0 {
         "text-empty"
     } else if used_cid_fallback {
         "cid-fallback"
@@ -530,7 +588,11 @@ fn extract_pdf(
                 .to_string(),
         );
     }
-
+    if image_decode_failures > 0 {
+        extraction_warnings.push(format!(
+            "{image_decode_failures} 个有效尺寸图片无法解码为像素，仍保留原始流 SHA-256 用于完全重复检测。"
+        ));
+    }
     Ok(PdfDocumentData {
         summary: FileSummary {
             id: format!("file-{file_index}"),
@@ -540,11 +602,13 @@ fn extract_pdf(
             total_text_chars,
             chunk_count: chunks.len(),
             image_count,
+            indexed_image_count,
             status: status.to_string(),
             error: None,
         },
         pages,
         chunks,
+        images,
         extraction_warnings,
     })
 }
@@ -623,6 +687,248 @@ fn identity_h_cids_to_fingerprint(bytes: &[u8]) -> String {
             char::from_u32(CID_FINGERPRINT_BASE + cid)
         })
         .collect()
+}
+
+#[derive(Default)]
+struct ExtractedPageImages {
+    discovered: usize,
+    decode_failures: usize,
+    images: Vec<PdfImage>,
+}
+
+fn extract_page_images(document: &Document, page_id: ObjectId, page: usize) -> ExtractedPageImages {
+    let mut output = ExtractedPageImages::default();
+    let mut visited_objects = HashSet::new();
+    let Ok((direct_resources, resource_ids)) = document.get_page_resources(page_id) else {
+        return output;
+    };
+
+    if let Some(resources) = direct_resources {
+        collect_images_from_resources(document, resources, page, &mut visited_objects, &mut output);
+    }
+    for resource_id in resource_ids {
+        let Ok(resources) = document.get_dictionary(resource_id) else {
+            continue;
+        };
+        collect_images_from_resources(document, resources, page, &mut visited_objects, &mut output);
+    }
+    output
+}
+
+fn collect_images_from_resources(
+    document: &Document,
+    resources: &Dictionary,
+    page: usize,
+    visited_objects: &mut HashSet<ObjectId>,
+    output: &mut ExtractedPageImages,
+) {
+    let Ok(xobjects) = resources
+        .get(b"XObject")
+        .and_then(|object| resolve_dictionary(document, object))
+    else {
+        return;
+    };
+
+    for (_, object) in xobjects.iter() {
+        let object = match object {
+            Object::Reference(id) => {
+                if !visited_objects.insert(*id) {
+                    continue;
+                }
+                let Ok(object) = document.get_object(*id) else {
+                    continue;
+                };
+                object
+            }
+            object => object,
+        };
+        let Ok(stream) = object.as_stream() else {
+            continue;
+        };
+        let subtype = stream.dict.get(b"Subtype").and_then(Object::as_name).ok();
+
+        if subtype == Some(b"Image") {
+            output.discovered += 1;
+            if let Some((image, decoded)) = pdf_image_from_stream(stream, page) {
+                if !decoded {
+                    output.decode_failures += 1;
+                }
+                output.images.push(image);
+            }
+        } else if subtype == Some(b"Form") {
+            let Ok(resources) = stream
+                .dict
+                .get(b"Resources")
+                .and_then(|object| resolve_dictionary(document, object))
+            else {
+                continue;
+            };
+            collect_images_from_resources(document, resources, page, visited_objects, output);
+        }
+    }
+}
+
+fn resolve_dictionary<'a>(
+    document: &'a Document,
+    object: &'a Object,
+) -> lopdf::Result<&'a Dictionary> {
+    match object {
+        Object::Reference(id) => document.get_dictionary(*id),
+        object => object.as_dict(),
+    }
+}
+
+fn pdf_image_from_stream(stream: &Stream, page: usize) -> Option<(PdfImage, bool)> {
+    let width = stream
+        .dict
+        .get(b"Width")
+        .and_then(Object::as_i64)
+        .ok()
+        .and_then(|value| u32::try_from(value).ok())?;
+    let height = stream
+        .dict
+        .get(b"Height")
+        .and_then(Object::as_i64)
+        .ok()
+        .and_then(|value| u32::try_from(value).ok())?;
+    let area = u64::from(width) * u64::from(height);
+    if width < MIN_IMAGE_DIMENSION || height < MIN_IMAGE_DIMENSION || area < MIN_IMAGE_AREA {
+        return None;
+    }
+
+    let sha256 = sha256_image_stream(stream, width, height);
+    let decoded_image = decode_pdf_image(stream, width, height);
+    let phash = decoded_image.as_ref().map(perceptual_hash);
+    Some((
+        PdfImage {
+            page,
+            width,
+            height,
+            area,
+            sha256,
+            phash,
+        },
+        decoded_image.is_some(),
+    ))
+}
+
+fn sha256_image_stream(stream: &Stream, width: u32, height: u32) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(width.to_be_bytes());
+    hasher.update(height.to_be_bytes());
+    hasher.update(&stream.content);
+    hasher.finalize().into()
+}
+
+fn decode_pdf_image(stream: &Stream, width: u32, height: u32) -> Option<GrayImage> {
+    let filters = stream.filters().unwrap_or_default();
+    if filters.iter().any(|filter| *filter == b"DCTDecode") {
+        return image::load_from_memory(&stream.content)
+            .ok()
+            .map(|image| image.to_luma8());
+    }
+    if filters
+        .iter()
+        .any(|filter| !matches!(*filter, b"FlateDecode" | b"LZWDecode" | b"ASCII85Decode"))
+    {
+        return None;
+    }
+
+    let content = stream.get_plain_content().ok()?;
+    let bits_per_component = stream
+        .dict
+        .get(b"BitsPerComponent")
+        .and_then(Object::as_i64)
+        .unwrap_or(8);
+    if bits_per_component != 8 {
+        return None;
+    }
+
+    match image_color_space_name(&stream.dict)? {
+        b"DeviceGray" | b"G" => GrayImage::from_raw(width, height, content),
+        b"DeviceRGB" | b"RGB" => gray_image_from_rgb(width, height, &content),
+        b"DeviceCMYK" | b"CMYK" => gray_image_from_cmyk(width, height, &content),
+        _ => None,
+    }
+}
+
+fn image_color_space_name(dict: &Dictionary) -> Option<&[u8]> {
+    let color_space = dict.get(b"ColorSpace").ok()?;
+    match color_space {
+        Object::Name(name) => Some(name),
+        Object::Array(items) => items.first()?.as_name().ok(),
+        _ => None,
+    }
+}
+
+fn gray_image_from_rgb(width: u32, height: u32, content: &[u8]) -> Option<GrayImage> {
+    let expected = width as usize * height as usize * 3;
+    if content.len() < expected {
+        return None;
+    }
+    let pixels = content[..expected]
+        .chunks_exact(3)
+        .map(|rgb| luma(rgb[0], rgb[1], rgb[2]))
+        .collect();
+    GrayImage::from_raw(width, height, pixels)
+}
+
+fn gray_image_from_cmyk(width: u32, height: u32, content: &[u8]) -> Option<GrayImage> {
+    let expected = width as usize * height as usize * 4;
+    if content.len() < expected {
+        return None;
+    }
+    let pixels = content[..expected]
+        .chunks_exact(4)
+        .map(|cmyk| {
+            let red = 255u16.saturating_sub(u16::from(cmyk[0]) + u16::from(cmyk[3]));
+            let green = 255u16.saturating_sub(u16::from(cmyk[1]) + u16::from(cmyk[3]));
+            let blue = 255u16.saturating_sub(u16::from(cmyk[2]) + u16::from(cmyk[3]));
+            luma(red as u8, green as u8, blue as u8)
+        })
+        .collect();
+    GrayImage::from_raw(width, height, pixels)
+}
+
+fn luma(red: u8, green: u8, blue: u8) -> u8 {
+    ((u32::from(red) * 299 + u32::from(green) * 587 + u32::from(blue) * 114) / 1_000) as u8
+}
+
+fn perceptual_hash(image: &GrayImage) -> u64 {
+    let resized = image::imageops::resize(image, 32, 32, FilterType::Triangle);
+    let mut coefficients = Vec::with_capacity(64);
+    for vertical_frequency in 0..8 {
+        for horizontal_frequency in 0..8 {
+            let mut value = 0.0f32;
+            for y in 0..32 {
+                for x in 0..32 {
+                    let pixel = f32::from(resized.get_pixel(x, y).0[0]);
+                    value += pixel
+                        * dct_basis(horizontal_frequency, x)
+                        * dct_basis(vertical_frequency, y);
+                }
+            }
+            coefficients.push(value);
+        }
+    }
+
+    let mut values_for_median = coefficients.iter().skip(1).copied().collect::<Vec<_>>();
+    values_for_median.sort_by(|left, right| left.partial_cmp(right).unwrap_or(Ordering::Equal));
+    let median = values_for_median[values_for_median.len() / 2];
+    coefficients
+        .iter()
+        .enumerate()
+        .fold(0u64, |hash, (bit, value)| {
+            if bit > 0 && *value >= median {
+                hash | (1u64 << bit)
+            } else {
+                hash
+            }
+        })
+}
+
+fn dct_basis(frequency: usize, position: u32) -> f32 {
+    ((std::f32::consts::PI / 32.0) * (position as f32 + 0.5) * frequency as f32).cos()
 }
 
 fn build_text_index(
@@ -801,11 +1107,155 @@ fn select_candidate_pairs(
     candidates
 }
 
+fn build_image_index(
+    docs: &[PdfDocumentData],
+    request: &AnalyzeRequest,
+) -> (HashMap<(usize, usize), f32>, HashSet<[u8; 32]>) {
+    let mut exact_postings: HashMap<[u8; 32], Vec<ImageRef>> = HashMap::new();
+    for (file_index, doc) in docs.iter().enumerate() {
+        for (image_index, image) in doc.images.iter().enumerate() {
+            exact_postings
+                .entry(image.sha256)
+                .or_default()
+                .push(ImageRef {
+                    file_index,
+                    image_index,
+                });
+        }
+    }
+
+    let common_image_hashes = exact_postings
+        .iter()
+        .filter_map(|(hash, refs)| image_posting_is_too_common(refs, docs).then_some(*hash))
+        .collect::<HashSet<_>>();
+    let mut candidate_scores = HashMap::new();
+
+    for (hash, refs) in &exact_postings {
+        if common_image_hashes.contains(hash) || refs.len() > MAX_IMAGE_POSTINGS {
+            continue;
+        }
+        add_image_candidates_from_posting(refs, docs, 1.0, &mut candidate_scores);
+    }
+
+    let mut phash_bands: HashMap<(usize, u16), Vec<ImageRef>> = HashMap::new();
+    for (file_index, doc) in docs.iter().enumerate() {
+        for (image_index, image) in doc.images.iter().enumerate() {
+            if common_image_hashes.contains(&image.sha256) {
+                continue;
+            }
+            let Some(phash) = image.phash else {
+                continue;
+            };
+            for band in 0..4 {
+                phash_bands
+                    .entry((band, ((phash >> (band * 16)) & 0xffff) as u16))
+                    .or_default()
+                    .push(ImageRef {
+                        file_index,
+                        image_index,
+                    });
+            }
+        }
+    }
+
+    let max_distance = image_phash_distance_threshold(request);
+    for refs in phash_bands.values() {
+        if refs.len() > MAX_IMAGE_POSTINGS || image_posting_is_too_common(refs, docs) {
+            continue;
+        }
+        for left_index in 0..refs.len() {
+            for right_index in (left_index + 1)..refs.len() {
+                let left = refs[left_index];
+                let right = refs[right_index];
+                if left.file_index == right.file_index {
+                    continue;
+                }
+                let left_image = &docs[left.file_index].images[left.image_index];
+                let right_image = &docs[right.file_index].images[right.image_index];
+                let Some(distance) = left_image
+                    .phash
+                    .zip(right_image.phash)
+                    .map(|(left, right)| hamming_distance(left, right))
+                else {
+                    continue;
+                };
+                if distance > max_distance {
+                    continue;
+                }
+                let pair = ordered_file_pair(left.file_index, right.file_index);
+                let similarity = 1.0 - distance as f32 / 64.0;
+                candidate_scores
+                    .entry(pair)
+                    .and_modify(|score: &mut f32| *score = score.max(similarity))
+                    .or_insert(similarity);
+            }
+        }
+    }
+
+    (candidate_scores, common_image_hashes)
+}
+
+fn add_image_candidates_from_posting(
+    refs: &[ImageRef],
+    docs: &[PdfDocumentData],
+    score: f32,
+    candidate_scores: &mut HashMap<(usize, usize), f32>,
+) {
+    if image_posting_is_too_common(refs, docs) {
+        return;
+    }
+    for left_index in 0..refs.len() {
+        for right_index in (left_index + 1)..refs.len() {
+            let left = refs[left_index];
+            let right = refs[right_index];
+            if left.file_index == right.file_index {
+                continue;
+            }
+            let pair = ordered_file_pair(left.file_index, right.file_index);
+            candidate_scores
+                .entry(pair)
+                .and_modify(|current| *current = current.max(score))
+                .or_insert(score);
+        }
+    }
+}
+
+fn image_posting_is_too_common(refs: &[ImageRef], docs: &[PdfDocumentData]) -> bool {
+    if docs.len() < 4
+        || refs.iter().any(|item| {
+            docs[item.file_index].images[item.image_index].area >= LARGE_SINGLE_IMAGE_AREA
+        })
+    {
+        return false;
+    }
+    let file_count = refs
+        .iter()
+        .map(|item| item.file_index)
+        .collect::<HashSet<_>>()
+        .len();
+    file_count > ((docs.len() + 1) / 2).min(MAX_COMMON_FEATURE_FILES)
+}
+
+fn ordered_file_pair(left: usize, right: usize) -> (usize, usize) {
+    if left < right {
+        (left, right)
+    } else {
+        (right, left)
+    }
+}
+
+fn image_phash_distance_threshold(request: &AnalyzeRequest) -> u32 {
+    ((1.0 - request.image_threshold) * 32.0)
+        .round()
+        .clamp(2.0, 10.0) as u32
+}
+
 fn compare_candidates(
     docs: &[PdfDocumentData],
     request: &AnalyzeRequest,
     candidate_scores: &HashMap<(usize, usize), f32>,
     chunk_pair_features: &HashMap<(usize, usize, usize, usize), u32>,
+    common_image_hashes: &HashSet<[u8; 32]>,
 ) -> Vec<SimilarityPair> {
     let mut pairs = Vec::new();
     let mut by_file_pair: HashMap<(usize, usize), Vec<(usize, usize, u32)>> = HashMap::new();
@@ -820,17 +1270,12 @@ fn compare_candidates(
     }
 
     for ((left_file, right_file), score) in candidate_scores {
-        let Some(candidates) = by_file_pair.get(&(*left_file, *right_file)) else {
-            continue;
-        };
-
         let left_doc = &docs[*left_file];
         let right_doc = &docs[*right_file];
-        if left_doc.chunks.is_empty() || right_doc.chunks.is_empty() {
-            continue;
-        }
-
-        let mut ranked = candidates.clone();
+        let mut ranked = by_file_pair
+            .get(&(*left_file, *right_file))
+            .cloned()
+            .unwrap_or_default();
         ranked.sort_by(|left, right| right.2.cmp(&left.2));
 
         let exact_pages = match_exact_pages(left_doc, right_doc);
@@ -936,20 +1381,35 @@ fn compare_candidates(
             }
         }
 
-        if matched_texts.is_empty() {
-            continue;
-        }
-
+        let matched_chars = covered_chars(&left_coverage).min(covered_chars(&right_coverage));
         let min_chars = left_doc
             .summary
             .total_text_chars
-            .min(right_doc.summary.total_text_chars)
-            .max(1);
-        let matched_chars = covered_chars(&left_coverage).min(covered_chars(&right_coverage));
-        let text_score = (matched_chars as f32 / min_chars as f32).min(1.0);
-        let image_score = 0.0;
+            .min(right_doc.summary.total_text_chars);
+        let text_score = if min_chars == 0 {
+            0.0
+        } else {
+            (matched_chars as f32 / min_chars as f32).min(1.0)
+        };
+        let (image_score, matched_images) =
+            match_images(left_doc, right_doc, request, common_image_hashes);
         let page_image_score = 0.0;
-        let final_score = text_score;
+        let has_text_evidence = !matched_texts.is_empty();
+        let has_image_evidence = matched_images.len() >= 2
+            || (image_score >= request.image_threshold
+                && matched_images.iter().any(|image| {
+                    u64::from(image.width) * u64::from(image.height) >= LARGE_SINGLE_IMAGE_AREA
+                }));
+        if !has_text_evidence && !has_image_evidence {
+            continue;
+        }
+
+        let final_score = match (has_text_evidence, has_image_evidence) {
+            (true, true) => text_score.max(text_score * 0.75 + image_score * 0.25),
+            (true, false) => text_score,
+            (false, true) => image_score,
+            (false, false) => 0.0,
+        };
 
         if final_score < 0.03 && *score < 1.0 {
             continue;
@@ -968,11 +1428,125 @@ fn compare_candidates(
             approximate_text_match_count,
             matched_text_chars: matched_chars,
             matched_texts,
-            matched_images: Vec::new(),
+            matched_images,
         });
     }
 
     pairs
+}
+
+fn match_images(
+    left_doc: &PdfDocumentData,
+    right_doc: &PdfDocumentData,
+    request: &AnalyzeRequest,
+    common_image_hashes: &HashSet<[u8; 32]>,
+) -> (f32, Vec<MatchedImage>) {
+    #[derive(Clone, Copy)]
+    struct ImageMatchCandidate {
+        left: usize,
+        right: usize,
+        distance: u32,
+        exact: bool,
+        weight: f32,
+    }
+
+    let max_distance = image_phash_distance_threshold(request);
+    let mut candidates = Vec::new();
+    for (left_index, left) in left_doc.images.iter().enumerate() {
+        if common_image_hashes.contains(&left.sha256) {
+            continue;
+        }
+        for (right_index, right) in right_doc.images.iter().enumerate() {
+            if common_image_hashes.contains(&right.sha256) {
+                continue;
+            }
+            let exact = left.sha256 == right.sha256;
+            let distance = if exact {
+                0
+            } else {
+                let Some(distance) = left
+                    .phash
+                    .zip(right.phash)
+                    .map(|(left, right)| hamming_distance(left, right))
+                else {
+                    continue;
+                };
+                distance
+            };
+            if !exact && distance > max_distance {
+                continue;
+            }
+            candidates.push(ImageMatchCandidate {
+                left: left_index,
+                right: right_index,
+                distance,
+                exact,
+                weight: image_weight(left).min(image_weight(right)),
+            });
+        }
+    }
+    candidates.sort_by(|left, right| {
+        right
+            .exact
+            .cmp(&left.exact)
+            .then(left.distance.cmp(&right.distance))
+            .then_with(|| {
+                right
+                    .weight
+                    .partial_cmp(&left.weight)
+                    .unwrap_or(Ordering::Equal)
+            })
+    });
+
+    let mut used_left = HashSet::new();
+    let mut used_right = HashSet::new();
+    let mut matched_weight = 0.0f32;
+    let mut matched_images = Vec::new();
+    for candidate in candidates {
+        if used_left.contains(&candidate.left) || used_right.contains(&candidate.right) {
+            continue;
+        }
+        used_left.insert(candidate.left);
+        used_right.insert(candidate.right);
+        let left = &left_doc.images[candidate.left];
+        let right = &right_doc.images[candidate.right];
+        matched_weight += candidate.weight;
+        if matched_images.len() < MAX_IMAGE_MATCHES_PER_PAIR {
+            matched_images.push(MatchedImage {
+                left_page: left.page,
+                right_page: right.page,
+                hamming_distance: candidate.distance,
+                similarity: 1.0 - candidate.distance as f32 / 64.0,
+                exact: candidate.exact,
+                width: left.width.min(right.width),
+                height: left.height.min(right.height),
+            });
+        }
+    }
+
+    let left_weight = left_doc
+        .images
+        .iter()
+        .filter(|image| !common_image_hashes.contains(&image.sha256))
+        .map(image_weight)
+        .sum::<f32>();
+    let right_weight = right_doc
+        .images
+        .iter()
+        .filter(|image| !common_image_hashes.contains(&image.sha256))
+        .map(image_weight)
+        .sum::<f32>();
+    let available_weight = left_weight.min(right_weight);
+    let score = if available_weight == 0.0 {
+        0.0
+    } else {
+        (matched_weight / available_weight).min(1.0)
+    };
+    (score, matched_images)
+}
+
+fn image_weight(image: &PdfImage) -> f32 {
+    image.area.min(2_000_000) as f32
 }
 
 fn match_exact_pages(
@@ -1126,6 +1700,7 @@ fn build_groups(pairs: &[SimilarityPair], request: &AnalyzeRequest) -> Vec<Simil
             quality_flags.push(GroupQualityFlag::NeedsManualReview);
         }
 
+        let has_image_evidence = relations.iter().any(|relation| relation.image_score > 0.0);
         groups.push(SimilarityGroup {
             group_id: format!("group-{}", groups.len() + 1),
             files,
@@ -1135,8 +1710,16 @@ fn build_groups(pairs: &[SimilarityPair], request: &AnalyzeRequest) -> Vec<Simil
             quality_flags,
             pair_relations: relations,
             representative_evidence: vec![GroupEvidence {
-                evidence_type: "text".to_string(),
-                summary: "组内文件存在共享文本 shingle 和确认雷同片段。".to_string(),
+                evidence_type: if has_image_evidence {
+                    "text-and-image".to_string()
+                } else {
+                    "text".to_string()
+                },
+                summary: if has_image_evidence {
+                    "组内文件存在确认文本或内嵌图片重复证据。".to_string()
+                } else {
+                    "组内文件存在共享文本 shingle 和确认雷同片段。".to_string()
+                },
             }],
         });
     }
@@ -1336,19 +1919,6 @@ fn hash_value(value: &str) -> u64 {
     hasher.finish()
 }
 
-fn count_images(document: &Document) -> usize {
-    document
-        .objects
-        .values()
-        .filter(|object| match object {
-            Object::Stream(stream) => {
-                matches!(stream.dict.get(b"Subtype"), Ok(Object::Name(name)) if name == b"Image")
-            }
-            _ => false,
-        })
-        .count()
-}
-
 pub fn export_report(
     result: &AnalysisResult,
     request: &ExportReportRequest,
@@ -1444,7 +2014,9 @@ fn build_word_document(result: &AnalysisResult, include_text_evidence: bool) -> 
     let ready_files = result
         .files
         .iter()
-        .filter(|file| file.status == "ready" || file.status == "cid-fallback")
+        .filter(|file| {
+            file.status == "ready" || file.status == "cid-fallback" || file.status == "image-only"
+        })
         .count();
     let failed_files = result.files.len().saturating_sub(ready_files);
     let exact_pages = result
@@ -1456,6 +2028,11 @@ fn build_word_document(result: &AnalysisResult, include_text_evidence: bool) -> 
         .pairs
         .iter()
         .map(|pair| pair.approximate_text_match_count)
+        .sum::<usize>();
+    let image_matches = result
+        .pairs
+        .iter()
+        .map(|pair| pair.matched_images.len())
         .sum::<usize>();
     let mut body = String::new();
 
@@ -1470,7 +2047,7 @@ fn build_word_document(result: &AnalysisResult, include_text_evidence: bool) -> 
         None,
     ));
     body.push_str(&word_paragraph(
-        "说明：本报告由本地文本检测引擎生成。图片 pHash、扫描件页面渲染和 OCR 尚未启用，结论应结合人工复核使用。",
+        "说明：本报告由本地检测引擎生成。已启用 PDF 内嵌图片 SHA-256 与 pHash 检测；扫描件页面渲染和 OCR 尚未启用，结论应结合人工复核使用。",
         None,
     ));
 
@@ -1499,8 +2076,14 @@ fn build_word_document(result: &AnalysisResult, include_text_evidence: bool) -> 
             vec![
                 "近似文本片段",
                 &approximate_matches.to_string(),
+                "匹配内嵌图片",
+                &image_matches.to_string(),
+            ],
+            vec![
                 "分析深度",
                 &settings.analysis_depth,
+                "图片确认阈值",
+                &format!("{:.2}", settings.image_threshold),
             ],
         ],
     ));
@@ -1512,8 +2095,8 @@ fn build_word_document(result: &AnalysisResult, include_text_evidence: bool) -> 
             vec![
                 "文本确认阈值",
                 &format!("{:.2}", settings.text_threshold),
-                "成组阈值",
-                &format!("{:.2}", settings.final_threshold),
+                "图片确认阈值",
+                &format!("{:.2}", settings.image_threshold),
             ],
             vec![
                 "目标块长度",
@@ -1536,8 +2119,8 @@ fn build_word_document(result: &AnalysisResult, include_text_evidence: bool) -> 
             vec![
                 "每对证据上限",
                 &settings.max_matches_per_pair.to_string(),
-                "候选阈值",
-                &format!("{:.2}", settings.candidate_score_threshold),
+                "成组阈值",
+                &format!("{:.2}", settings.final_threshold),
             ],
         ],
     ));
@@ -1570,11 +2153,12 @@ fn build_word_document(result: &AnalysisResult, include_text_evidence: bool) -> 
                     relation.right_file.clone(),
                     format!("{:.2}", relation.final_score),
                     format!("{:.2}", relation.text_score),
+                    format!("{:.2}", relation.image_score),
                 ]
             })
             .collect::<Vec<_>>();
         body.push_str(&word_table_owned(
-            &["文件 A", "文件 B", "综合", "文本"],
+            &["文件 A", "文件 B", "综合", "文本", "图片"],
             &relation_rows,
         ));
     }
@@ -1594,12 +2178,21 @@ fn build_word_document(result: &AnalysisResult, include_text_evidence: bool) -> 
             Some("Heading2"),
         ));
         body.push_str(&word_table(
-            &["综合分", "精确页", "近似片段", "覆盖字符"],
+            &[
+                "综合分",
+                "文本分",
+                "图片分",
+                "精确页",
+                "近似片段",
+                "图片证据",
+            ],
             &[vec![
                 &format!("{:.2}", pair.final_score),
+                &format!("{:.2}", pair.text_score),
+                &format!("{:.2}", pair.image_score),
                 &pair.exact_page_match_count.to_string(),
                 &pair.approximate_text_match_count.to_string(),
-                &pair.matched_text_chars.to_string(),
+                &pair.matched_images.len().to_string(),
             ]],
         ));
         if include_text_evidence {
@@ -1615,6 +2208,24 @@ fn build_word_document(result: &AnalysisResult, include_text_evidence: bool) -> 
                     None,
                 ));
             }
+        }
+        for evidence in pair.matched_images.iter().take(5) {
+            body.push_str(&word_paragraph(
+                &format!(
+                    "图片证据：A 第 {} 页 / B 第 {} 页，{}，pHash 距离 {}，尺寸 {}×{}",
+                    evidence.left_page,
+                    evidence.right_page,
+                    if evidence.exact {
+                        "完全重复"
+                    } else {
+                        "近似重复"
+                    },
+                    evidence.hamming_distance,
+                    evidence.width,
+                    evidence.height
+                ),
+                None,
+            ));
         }
     }
 
@@ -1764,6 +2375,90 @@ fn level_for_score(score: f32) -> SimilarityLevel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lopdf::dictionary;
+
+    fn test_doc(id: usize, images: Vec<PdfImage>) -> PdfDocumentData {
+        PdfDocumentData {
+            summary: FileSummary {
+                id: format!("file-{id}"),
+                path: format!("file-{id}.pdf"),
+                file_name: format!("file-{id}.pdf"),
+                page_count: 1,
+                total_text_chars: 0,
+                chunk_count: 0,
+                image_count: images.len(),
+                indexed_image_count: images.len(),
+                status: "image-only".to_string(),
+                error: None,
+            },
+            pages: Vec::new(),
+            chunks: Vec::new(),
+            images,
+            extraction_warnings: Vec::new(),
+        }
+    }
+
+    fn test_image(page: usize, sha_byte: u8, phash: Option<u64>) -> PdfImage {
+        test_image_with_dimensions(page, sha_byte, phash, 400, 300)
+    }
+
+    fn test_image_with_dimensions(
+        page: usize,
+        sha_byte: u8,
+        phash: Option<u64>,
+        width: u32,
+        height: u32,
+    ) -> PdfImage {
+        PdfImage {
+            page,
+            width,
+            height,
+            area: u64::from(width) * u64::from(height),
+            sha256: [sha_byte; 32],
+            phash,
+        }
+    }
+
+    fn write_image_only_pdf(path: &Path, pixels: Vec<u8>) {
+        let mut document = Document::with_version("1.5");
+        let pages_id = document.new_object_id();
+        let image_id = document.add_object(Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Image",
+                "Width" => 400,
+                "Height" => 300,
+                "ColorSpace" => "DeviceGray",
+                "BitsPerComponent" => 8,
+            },
+            pixels,
+        ));
+        let page_id = document.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 400.into(), 300.into()],
+            "Resources" => dictionary! {
+                "XObject" => dictionary! {
+                    "Im1" => image_id,
+                },
+            },
+        });
+        document.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![page_id.into()],
+                "Count" => 1,
+            }),
+        );
+        let catalog_id = document.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => pages_id,
+        });
+        document.trailer.set("Root", catalog_id);
+        document.compress();
+        document.save(path).unwrap();
+    }
 
     #[test]
     fn normalizes_mixed_text() {
@@ -1837,5 +2532,133 @@ mod tests {
         add_coverage(&mut coverage, 2, 10, 30);
 
         assert_eq!(covered_chars(&coverage), 180);
+    }
+
+    #[test]
+    fn perceptual_hash_survives_resize() {
+        let image = GrayImage::from_fn(64, 64, |x, y| image::Luma([((x * 3 + y * 5) % 255) as u8]));
+        let resized = image::imageops::resize(&image, 96, 96, FilterType::Triangle);
+
+        assert!(hamming_distance(perceptual_hash(&image), perceptual_hash(&resized)) <= 4);
+    }
+
+    #[test]
+    fn matches_exact_images_without_text() {
+        let left = test_doc(0, vec![test_image(2, 7, None)]);
+        let right = test_doc(1, vec![test_image(5, 7, None)]);
+
+        let (score, matches) =
+            match_images(&left, &right, &AnalyzeRequest::default(), &HashSet::new());
+
+        assert_eq!(score, 1.0);
+        assert_eq!(matches.len(), 1);
+        assert!(matches[0].exact);
+        assert_eq!((matches[0].left_page, matches[0].right_page), (2, 5));
+    }
+
+    #[test]
+    fn filters_images_shared_by_most_files() {
+        let docs = (0..4)
+            .map(|index| {
+                test_doc(
+                    index,
+                    vec![test_image_with_dimensions(1, 9, Some(0x1234), 80, 80)],
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let (candidates, common_hashes) = build_image_index(&docs, &AnalyzeRequest::default());
+
+        assert!(candidates.is_empty());
+        assert!(common_hashes.contains(&[9; 32]));
+    }
+
+    #[test]
+    fn keeps_large_images_shared_by_most_files() {
+        let docs = (0..4)
+            .map(|index| test_doc(index, vec![test_image(1, 9, Some(0x1234))]))
+            .collect::<Vec<_>>();
+
+        let (candidates, common_hashes) = build_image_index(&docs, &AnalyzeRequest::default());
+
+        assert_eq!(candidates.len(), 6);
+        assert!(!common_hashes.contains(&[9; 32]));
+    }
+
+    #[test]
+    fn extracts_page_image_xobjects_and_builds_phash() {
+        let mut document = Document::with_version("1.5");
+        let pixels = (0..64 * 64)
+            .map(|index| (index % 255) as u8)
+            .collect::<Vec<_>>();
+        let image_id = document.add_object(Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Image",
+                "Width" => 64,
+                "Height" => 64,
+                "ColorSpace" => "DeviceGray",
+                "BitsPerComponent" => 8,
+            },
+            pixels,
+        ));
+        let page_id = document.add_object(dictionary! {
+            "Type" => "Page",
+            "Resources" => dictionary! {
+                "XObject" => dictionary! {
+                    "Im1" => image_id,
+                },
+            },
+        });
+
+        let extracted = extract_page_images(&document, page_id, 3);
+
+        assert_eq!(extracted.discovered, 1);
+        assert_eq!(extracted.decode_failures, 0);
+        assert_eq!(extracted.images.len(), 1);
+        assert_eq!(extracted.images[0].page, 3);
+        assert!(extracted.images[0].phash.is_some());
+    }
+
+    #[test]
+    fn detects_image_only_pdf_pair_end_to_end() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "pdf-similarity-image-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&temp_dir).unwrap();
+        let left_path = temp_dir.join("left.pdf");
+        let right_path = temp_dir.join("right.pdf");
+        let pixels = (0..400 * 300)
+            .map(|index| (index % 255) as u8)
+            .collect::<Vec<_>>();
+        write_image_only_pdf(&left_path, pixels.clone());
+        write_image_only_pdf(&right_path, pixels);
+
+        let result = run_analysis(
+            AnalyzeRequest {
+                paths: vec![
+                    left_path.to_string_lossy().to_string(),
+                    right_path.to_string_lossy().to_string(),
+                ],
+                ..AnalyzeRequest::default()
+            },
+            format!("image-test-{}", uuid::Uuid::new_v4()),
+            |_| {},
+            || false,
+        );
+
+        assert_eq!(result.files[0].status, "image-only");
+        assert_eq!(result.files[0].indexed_image_count, 1);
+        assert_eq!(result.pairs.len(), 1);
+        assert_eq!(result.pairs[0].image_score, 1.0);
+        assert_eq!(result.pairs[0].final_score, 1.0);
+        assert_eq!(result.pairs[0].matched_images.len(), 1);
+        assert_eq!(result.groups.len(), 1);
+
+        if let Some(report_path) = result.report_path {
+            let _ = fs::remove_file(report_path);
+        }
+        let _ = fs::remove_dir_all(temp_dir);
     }
 }
