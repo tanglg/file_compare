@@ -1,4 +1,5 @@
 use chrono::Utc;
+use lopdf::content::Content;
 use lopdf::{Document, Object};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
@@ -23,6 +24,7 @@ const CANDIDATE_SCORE_THRESHOLD: f32 = 0.35;
 const CANDIDATE_TOP_K_PER_FILE: usize = 20;
 const CANDIDATE_MIN_CHUNK_PAIRS: usize = 2;
 const CANDIDATE_STRONG_SINGLE_CHUNK_SHINGLES: u32 = 16;
+const CID_FINGERPRINT_BASE: u32 = 0xF0000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AnalyzeRequest {
@@ -213,6 +215,7 @@ pub struct MatchedText {
     pub left_page: usize,
     pub right_page: usize,
     pub similarity: f32,
+    pub text_readable: bool,
     pub left_text: String,
     pub right_text: String,
 }
@@ -271,6 +274,7 @@ struct PdfDocumentData {
     summary: FileSummary,
     pages: Vec<PageText>,
     chunks: Vec<TextChunk>,
+    extraction_warnings: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -340,6 +344,11 @@ pub fn run_analysis(
             Ok(doc) => {
                 progress.processed_files += 1;
                 progress.processed_pages += doc.summary.page_count;
+                warnings.extend(
+                    doc.extraction_warnings
+                        .iter()
+                        .map(|warning| format!("{}: {warning}", doc.summary.file_name)),
+                );
                 docs.push(doc);
             }
             Err(error) => {
@@ -359,6 +368,7 @@ pub fn run_analysis(
                     },
                     pages: Vec::new(),
                     chunks: Vec::new(),
+                    extraction_warnings: Vec::new(),
                 });
             }
         }
@@ -457,6 +467,8 @@ fn extract_pdf(
 
     let image_count = count_images(&document);
     let mut raw_pages = Vec::with_capacity(page_count);
+    let mut used_cid_fallback = false;
+    let mut extraction_errors = Vec::new();
 
     for (page_offset, page_number) in pages.keys().enumerate() {
         if should_cancel() {
@@ -470,7 +482,29 @@ fn extract_pdf(
             update_progress(progress, timer, on_progress);
         }
 
-        let raw_text = document.extract_text(&[*page_number]).unwrap_or_default();
+        let raw_text = match document.extract_text(&[*page_number]) {
+            Ok(text) => text,
+            Err(error) => match extract_identity_h_cid_text(&document, *page_number) {
+                Ok(text) if !text.is_empty() => {
+                    used_cid_fallback = true;
+                    text
+                }
+                Ok(_) => {
+                    if extraction_errors.len() < 3 {
+                        extraction_errors.push(format!("第 {page} 页文本抽取失败: {error}"));
+                    }
+                    String::new()
+                }
+                Err(fallback_error) => {
+                    if extraction_errors.len() < 3 {
+                        extraction_errors.push(format!(
+                            "第 {page} 页文本抽取失败: {error}; CID 回退失败: {fallback_error}"
+                        ));
+                    }
+                    String::new()
+                }
+            },
+        };
         raw_pages.push((page, raw_text));
     }
 
@@ -483,9 +517,19 @@ fn extract_pdf(
 
     let status = if total_text_chars == 0 {
         "text-empty"
+    } else if used_cid_fallback {
+        "cid-fallback"
     } else {
         "ready"
     };
+
+    let mut extraction_warnings = extraction_errors;
+    if used_cid_fallback {
+        extraction_warnings.push(
+            "PDF 缺少中文 CID 字体的 ToUnicode 映射，已使用 CID 字形序列生成指纹；字数为字形数，证据预览无法还原可读中文。"
+                .to_string(),
+        );
+    }
 
     Ok(PdfDocumentData {
         summary: FileSummary {
@@ -501,7 +545,84 @@ fn extract_pdf(
         },
         pages,
         chunks,
+        extraction_warnings,
     })
+}
+
+fn extract_identity_h_cid_text(document: &Document, page_number: u32) -> Result<String, String> {
+    let pages = document.get_pages();
+    let page_id = pages
+        .get(&page_number)
+        .copied()
+        .ok_or_else(|| format!("页码不存在: {page_number}"))?;
+    let cid_fonts = document
+        .get_page_fonts(page_id)
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .filter_map(|(name, font)| {
+            let is_identity_h = matches!(
+                font.get(b"Encoding"),
+                Ok(Object::Name(encoding)) if encoding == b"Identity-H"
+            );
+            let has_to_unicode = font.get(b"ToUnicode").is_ok();
+            (is_identity_h && !has_to_unicode).then_some(name)
+        })
+        .collect::<HashSet<_>>();
+
+    if cid_fonts.is_empty() {
+        return Err("没有可回退的 Identity-H CID 字体".to_string());
+    }
+
+    let content_data = document
+        .get_page_content(page_id)
+        .map_err(|error| error.to_string())?;
+    let content = Content::decode(&content_data).map_err(|error| error.to_string())?;
+    let mut current_font_is_cid = false;
+    let mut text = String::new();
+
+    for operation in content.operations {
+        match operation.operator.as_str() {
+            "Tf" => {
+                current_font_is_cid = operation
+                    .operands
+                    .first()
+                    .and_then(|operand| operand.as_name().ok())
+                    .map(|font| cid_fonts.contains(font))
+                    .unwrap_or(false);
+            }
+            "Tj" | "TJ" if current_font_is_cid => {
+                collect_identity_h_cids(&operation.operands, &mut text);
+            }
+            "ET" if current_font_is_cid && !text.ends_with('\n') => text.push('\n'),
+            _ => {}
+        }
+    }
+
+    Ok(text)
+}
+
+fn collect_identity_h_cids(operands: &[Object], text: &mut String) {
+    for operand in operands {
+        match operand {
+            Object::String(bytes, _) => text.push_str(&identity_h_cids_to_fingerprint(bytes)),
+            Object::Array(items) => collect_identity_h_cids(items, text),
+            _ => {}
+        }
+    }
+}
+
+fn identity_h_cids_to_fingerprint(bytes: &[u8]) -> String {
+    bytes
+        .chunks(2)
+        .filter_map(|chunk| {
+            let cid = if chunk.len() == 2 {
+                u16::from_be_bytes([chunk[0], chunk[1]]) as u32
+            } else {
+                chunk[0] as u32
+            };
+            char::from_u32(CID_FINGERPRINT_BASE + cid)
+        })
+        .collect()
 }
 
 fn build_text_index(
@@ -748,6 +869,8 @@ fn compare_candidates(
                     left_page: left_page_text.page,
                     right_page: right_page_text.page,
                     similarity: 1.0,
+                    text_readable: text_is_readable(&left_page_text.text)
+                        && text_is_readable(&right_page_text.text),
                     left_text: preview(&left_page_text.text),
                     right_text: preview(&right_page_text.text),
                 });
@@ -805,6 +928,8 @@ fn compare_candidates(
                     left_page: left_chunk.page,
                     right_page: right_chunk.page,
                     similarity: jaccard.max(shared_ratio).min(1.0),
+                    text_readable: text_is_readable(&left_chunk.text)
+                        && text_is_readable(&right_chunk.text),
                     left_text: preview(&left_chunk.text),
                     right_text: preview(&right_chunk.text),
                 });
@@ -1131,7 +1256,7 @@ fn normalize_text(input: &str) -> String {
     for ch in input.chars() {
         let normalized = if ch.is_ascii_alphanumeric() {
             Some(ch.to_ascii_lowercase())
-        } else if is_cjk(ch) {
+        } else if is_cjk(ch) || is_cid_fingerprint(ch) {
             Some(ch)
         } else if ch.is_whitespace() {
             Some(' ')
@@ -1153,6 +1278,10 @@ fn normalize_text(input: &str) -> String {
     }
 
     output.trim().to_string()
+}
+
+fn is_cid_fingerprint(ch: char) -> bool {
+    (CID_FINGERPRINT_BASE..=CID_FINGERPRINT_BASE + u16::MAX as u32).contains(&(ch as u32))
 }
 
 fn is_cjk(ch: char) -> bool {
@@ -1315,7 +1444,7 @@ fn build_word_document(result: &AnalysisResult, include_text_evidence: bool) -> 
     let ready_files = result
         .files
         .iter()
-        .filter(|file| file.status == "ready")
+        .filter(|file| file.status == "ready" || file.status == "cid-fallback")
         .count();
     let failed_files = result.files.len().saturating_sub(ready_files);
     let exact_pages = result
@@ -1604,11 +1733,20 @@ fn file_name(path: &str) -> String {
 }
 
 fn preview(text: &str) -> String {
+    if !text_is_readable(text) {
+        return "PDF 缺少 ToUnicode 映射，无法还原可读中文；当前仅使用 CID 字形指纹进行雷同性比对。"
+            .to_string();
+    }
+
     let mut value = text.chars().take(360).collect::<String>();
     if text.chars().count() > 360 {
         value.push_str("...");
     }
     value
+}
+
+fn text_is_readable(text: &str) -> bool {
+    !text.chars().any(is_cid_fingerprint)
 }
 
 fn level_for_score(score: f32) -> SimilarityLevel {
@@ -1630,6 +1768,16 @@ mod tests {
     #[test]
     fn normalizes_mixed_text() {
         assert_eq!(normalize_text(" A股！深圳 长亮科技 "), "a股深圳 长亮科技");
+    }
+
+    #[test]
+    fn preserves_identity_h_cids_for_fingerprinting() {
+        let fingerprint = identity_h_cids_to_fingerprint(&[0x0a, 0xc5, 0x07, 0x53]);
+
+        assert_eq!(fingerprint.chars().count(), 2);
+        assert_eq!(normalize_text(&fingerprint), fingerprint);
+        assert!(!text_is_readable(&fingerprint));
+        assert!(preview(&fingerprint).contains("无法还原可读中文"));
     }
 
     #[test]

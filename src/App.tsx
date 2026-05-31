@@ -61,6 +61,7 @@ type MatchedText = {
   left_page: number;
   right_page: number;
   similarity: number;
+  text_readable: boolean;
   left_text: string;
   right_text: string;
 };
@@ -258,6 +259,7 @@ function statusLabel(status: string) {
   return (
     {
       ready: "已索引",
+      "cid-fallback": "CID 指纹",
       failed: "失败",
       "text-empty": "文本较少",
     }[status] ?? status
@@ -719,12 +721,28 @@ export function App() {
           <RightPanel title="代表雷同文本" action={selectedPair ? "文件对证据" : "等待选择"}>
             {selectedPair?.matched_texts[0] ? (
               <>
-                <blockquote>{selectedPair.matched_texts[0].left_text}</blockquote>
+                {selectedPair.matched_texts[0].text_readable ? (
+                  <blockquote>{selectedPair.matched_texts[0].left_text}</blockquote>
+                ) : (
+                  <div className="warning-box">
+                    <AlertTriangle size={15} />
+                    PDF 缺少 ToUnicode 字体映射，无法展示可读中文。当前关系来自 CID 字形指纹比对，仍可用于判断雷同性。
+                  </div>
+                )}
                 <SummaryRow
                   label="出现位置"
                   value={`A P${selectedPair.matched_texts[0].left_page} / B P${selectedPair.matched_texts[0].right_page}`}
                 />
-                <SummaryRow label="证据类型" value={selectedPair.exact_page_match_count ? "精确页面" : "近似文本"} />
+                <SummaryRow
+                  label="证据类型"
+                  value={
+                    selectedPair.matched_texts[0].text_readable
+                      ? selectedPair.exact_page_match_count
+                        ? "精确页面"
+                        : "近似文本"
+                      : "CID 字形指纹"
+                  }
+                />
               </>
             ) : (
               <Empty copy="选择关系后查看代表文本。" />
