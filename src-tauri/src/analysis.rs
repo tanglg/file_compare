@@ -22,6 +22,8 @@ const MIN_SHARED_SHINGLES: u32 = 3;
 const MAX_COMMON_FEATURE_FILES: usize = 10;
 const MAX_POSTINGS_PER_FEATURE: usize = 180;
 const MAX_MATCHES_PER_PAIR: usize = 30;
+const MAX_CHUNK_COMPARISONS_PER_PAIR: usize = 2_000;
+const MAX_INDEX_SHINGLES_PER_CHUNK: usize = 220;
 const MIN_EXACT_PAGE_CHARS: usize = 1;
 const CANDIDATE_SCORE_THRESHOLD: f32 = 0.35;
 const CANDIDATE_TOP_K_PER_FILE: usize = 20;
@@ -155,6 +157,7 @@ pub enum AnalysisStage {
     Init,
     ReadingMeta,
     BuildingTextIndex,
+    RecallingCandidates,
     ComparingText,
     GeneratingReport,
     Done,
@@ -206,6 +209,8 @@ pub struct FileSummary {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SimilarityPair {
     pub pair_id: String,
+    pub left_file_id: String,
+    pub right_file_id: String,
     pub left_file: String,
     pub right_file: String,
     pub text_score: f32,
@@ -244,6 +249,7 @@ pub struct MatchedImage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SimilarityGroup {
     pub group_id: String,
+    pub file_ids: Vec<String>,
     pub files: Vec<String>,
     pub group_score: f32,
     pub level: SimilarityLevel,
@@ -255,6 +261,8 @@ pub struct SimilarityGroup {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PairRelation {
+    pub left_file_id: String,
+    pub right_file_id: String,
     pub left_file: String,
     pub right_file: String,
     pub final_score: f32,
@@ -307,7 +315,7 @@ struct TextChunk {
     end: usize,
     text: String,
     text_hash: u64,
-    shingles: Vec<u64>,
+    index_shingles: Vec<u64>,
     shingle_set: HashSet<u64>,
     simhash: u64,
 }
@@ -337,6 +345,7 @@ struct ImageRef {
 pub fn run_analysis(
     request: AnalyzeRequest,
     task_id: String,
+    report_dir: &Path,
     on_progress: impl Fn(AnalysisProgress),
     should_cancel: impl Fn() -> bool,
 ) -> AnalysisResult {
@@ -416,6 +425,11 @@ pub fn run_analysis(
     update_progress(&mut progress, timer, &on_progress);
 
     let (mut candidate_scores, chunk_pair_features) = build_text_index(&docs, &request);
+
+    progress.stage = AnalysisStage::RecallingCandidates;
+    progress.message = "正在合并文本与图片候选并执行降噪。".to_string();
+    update_progress(&mut progress, timer, &on_progress);
+
     let (image_candidate_scores, common_image_hashes) = build_image_index(&docs, &request);
     for (pair, score) in image_candidate_scores {
         candidate_scores
@@ -477,7 +491,7 @@ pub fn run_analysis(
         warnings,
     };
 
-    match write_report(&result) {
+    match write_report(&result, report_dir) {
         Ok(path) => result.report_path = Some(path.to_string_lossy().to_string()),
         Err(error) => result.warnings.push(format!("报告写入失败: {error}")),
     }
@@ -942,7 +956,7 @@ fn build_text_index(
 
     for (file_index, doc) in docs.iter().enumerate() {
         for (chunk_index, chunk) in doc.chunks.iter().enumerate() {
-            for hash in &chunk.shingles {
+            for hash in &chunk.index_shingles {
                 postings.entry(*hash).or_default().push(ChunkRef {
                     file_index,
                     chunk_index,
@@ -1322,7 +1336,9 @@ fn compare_candidates(
             }
         }
 
-        for (left_chunk_index, right_chunk_index, shared) in ranked.into_iter().take(2_000) {
+        for (left_chunk_index, right_chunk_index, shared) in
+            ranked.into_iter().take(MAX_CHUNK_COMPARISONS_PER_PAIR)
+        {
             if used_left.contains(&left_chunk_index) || used_right.contains(&right_chunk_index) {
                 continue;
             }
@@ -1417,6 +1433,8 @@ fn compare_candidates(
 
         pairs.push(SimilarityPair {
             pair_id: format!("pair-{}-{}", left_doc.summary.id, right_doc.summary.id),
+            left_file_id: left_doc.summary.id.clone(),
+            right_file_id: right_doc.summary.id.clone(),
             left_file: left_doc.summary.file_name.clone(),
             right_file: right_doc.summary.file_name.clone(),
             text_score,
@@ -1627,16 +1645,19 @@ fn build_groups(pairs: &[SimilarityPair], request: &AnalyzeRequest) -> Vec<Simil
         .filter(|pair| pair.final_score >= request.final_threshold)
         .collect::<Vec<_>>();
     let mut adjacency: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut file_names = HashMap::new();
 
     for pair in &strong_pairs {
+        file_names.insert(pair.left_file_id.clone(), pair.left_file.clone());
+        file_names.insert(pair.right_file_id.clone(), pair.right_file.clone());
         adjacency
-            .entry(pair.left_file.clone())
+            .entry(pair.left_file_id.clone())
             .or_default()
-            .insert(pair.right_file.clone());
+            .insert(pair.right_file_id.clone());
         adjacency
-            .entry(pair.right_file.clone())
+            .entry(pair.right_file_id.clone())
             .or_default()
-            .insert(pair.left_file.clone());
+            .insert(pair.left_file_id.clone());
     }
 
     let mut visited = HashSet::new();
@@ -1648,11 +1669,11 @@ fn build_groups(pairs: &[SimilarityPair], request: &AnalyzeRequest) -> Vec<Simil
         }
 
         let mut stack = vec![file.clone()];
-        let mut files = Vec::new();
+        let mut file_ids = Vec::new();
         visited.insert(file.clone());
 
         while let Some(current) = stack.pop() {
-            files.push(current.clone());
+            file_ids.push(current.clone());
             if let Some(neighbors) = adjacency.get(&current) {
                 for neighbor in neighbors {
                     if visited.insert(neighbor.clone()) {
@@ -1662,18 +1683,20 @@ fn build_groups(pairs: &[SimilarityPair], request: &AnalyzeRequest) -> Vec<Simil
             }
         }
 
-        files.sort();
-        if files.len() < 2 {
+        file_ids.sort();
+        if file_ids.len() < 2 {
             continue;
         }
 
-        let file_set = files.iter().cloned().collect::<HashSet<_>>();
+        let file_set = file_ids.iter().cloned().collect::<HashSet<_>>();
         let relations = strong_pairs
             .iter()
             .filter(|pair| {
-                file_set.contains(&pair.left_file) && file_set.contains(&pair.right_file)
+                file_set.contains(&pair.left_file_id) && file_set.contains(&pair.right_file_id)
             })
             .map(|pair| PairRelation {
+                left_file_id: pair.left_file_id.clone(),
+                right_file_id: pair.right_file_id.clone(),
                 left_file: pair.left_file.clone(),
                 right_file: pair.right_file.clone(),
                 final_score: pair.final_score,
@@ -1683,17 +1706,14 @@ fn build_groups(pairs: &[SimilarityPair], request: &AnalyzeRequest) -> Vec<Simil
             })
             .collect::<Vec<_>>();
 
-        let possible_edges = (files.len() * (files.len() - 1) / 2).max(1);
+        let possible_edges = (file_ids.len() * (file_ids.len() - 1) / 2).max(1);
         let graph_density = relations.len() as f32 / possible_edges as f32;
         let average_score = relations
             .iter()
             .map(|relation| relation.final_score)
             .sum::<f32>()
             / relations.len().max(1) as f32;
-        let common_evidence_coverage = graph_density;
-        let group_score =
-            (average_score * 0.55 + common_evidence_coverage * 0.25 + graph_density * 0.20)
-                .min(1.0);
+        let group_score = (average_score * 0.55 + graph_density * 0.45).min(1.0);
         let mut quality_flags = Vec::new();
         if graph_density < 0.5 {
             quality_flags.push(GroupQualityFlag::WeakConnection);
@@ -1703,7 +1723,11 @@ fn build_groups(pairs: &[SimilarityPair], request: &AnalyzeRequest) -> Vec<Simil
         let has_image_evidence = relations.iter().any(|relation| relation.image_score > 0.0);
         groups.push(SimilarityGroup {
             group_id: format!("group-{}", groups.len() + 1),
-            files,
+            files: file_ids
+                .iter()
+                .map(|id| file_names.get(id).cloned().unwrap_or_else(|| id.clone()))
+                .collect(),
+            file_ids,
             group_score,
             level: level_for_score(group_score),
             graph_density,
@@ -1790,6 +1814,7 @@ fn chunk_text(text: &str, page: usize, request: &AnalyzeRequest) -> Vec<TextChun
         let chunk_text = chars[start..end].iter().collect::<String>();
         let shingles = shingles(&chunk_text, request.shingle_size);
         if !shingles.is_empty() {
+            let index_shingles = minhash_sketch(&shingles);
             let shingle_set = shingles.iter().copied().collect::<HashSet<_>>();
             chunks.push(TextChunk {
                 page,
@@ -1798,7 +1823,7 @@ fn chunk_text(text: &str, page: usize, request: &AnalyzeRequest) -> Vec<TextChun
                 text_hash: hash_value(&chunk_text),
                 text: chunk_text,
                 simhash: simhash(&shingles),
-                shingles,
+                index_shingles,
                 shingle_set,
             });
         }
@@ -1825,11 +1850,15 @@ fn shingles(text: &str, shingle_size: usize) -> Vec<u64> {
 
     let mut values = unique.into_iter().collect::<Vec<_>>();
     values.sort_unstable();
-    if values.len() > 220 {
-        let step = (values.len() / 220).max(1);
-        values = values.into_iter().step_by(step).take(220).collect();
-    }
     values
+}
+
+fn minhash_sketch(shingles: &[u64]) -> Vec<u64> {
+    shingles
+        .iter()
+        .take(MAX_INDEX_SHINGLES_PER_CHUNK)
+        .copied()
+        .collect()
 }
 
 fn normalize_text(input: &str) -> String {
@@ -1871,6 +1900,7 @@ fn is_cjk(ch: char) -> bool {
     ('\u{4e00}'..='\u{9fff}').contains(&ch)
         || ('\u{3400}'..='\u{4dbf}').contains(&ch)
         || ('\u{f900}'..='\u{faff}').contains(&ch)
+        || ('\u{20000}'..='\u{323af}').contains(&ch)
 }
 
 fn simhash(shingles: &[u64]) -> u64 {
@@ -1941,7 +1971,8 @@ pub fn export_report(
 
     if request.export_json {
         let path = output_dir.join(format!("{base_name}.json"));
-        let json = serde_json::to_string_pretty(result).map_err(|error| error.to_string())?;
+        let json = serde_json::to_string_pretty(&sanitized_report(result))
+            .map_err(|error| error.to_string())?;
         fs::write(&path, json).map_err(|error| format!("JSON 报告写入失败: {error}"))?;
         exported_files.push(path.to_string_lossy().to_string());
     }
@@ -1978,6 +2009,14 @@ fn write_word_report(
             r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
   <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
+</Relationships>"#
+                .to_string(),
+        ),
+        (
+            "word/_rels/document.xml.rels",
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>
 </Relationships>"#
                 .to_string(),
         ),
@@ -2310,14 +2349,28 @@ fn xml_escape(text: &str) -> String {
         .replace('\'', "&apos;")
 }
 
-fn write_report(result: &AnalysisResult) -> Result<PathBuf, String> {
-    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
-    let output_dir = cwd.join("analysis_results");
-    fs::create_dir_all(&output_dir).map_err(|error| error.to_string())?;
+fn write_report(result: &AnalysisResult, output_dir: &Path) -> Result<PathBuf, String> {
+    fs::create_dir_all(output_dir).map_err(|error| error.to_string())?;
     let path = output_dir.join(format!("report_{}.json", result.task_id));
-    let json = serde_json::to_string_pretty(result).map_err(|error| error.to_string())?;
+    let json = serde_json::to_string_pretty(&sanitized_report(result))
+        .map_err(|error| error.to_string())?;
     fs::write(&path, json).map_err(|error| error.to_string())?;
     Ok(path)
+}
+
+fn sanitized_report(result: &AnalysisResult) -> AnalysisResult {
+    let mut sanitized = result.clone();
+    sanitized.analysis_settings.paths = sanitized
+        .analysis_settings
+        .paths
+        .iter()
+        .map(|path| file_name(path))
+        .collect();
+    for file in &mut sanitized.files {
+        file.path = file.file_name.clone();
+    }
+    sanitized.report_path = None;
+    sanitized
 }
 
 fn update_progress(
@@ -2349,8 +2402,9 @@ fn preview(text: &str) -> String {
             .to_string();
     }
 
-    let mut value = text.chars().take(360).collect::<String>();
-    if text.chars().count() > 360 {
+    let mut chars = text.chars();
+    let mut value = chars.by_ref().take(360).collect::<String>();
+    if chars.next().is_some() {
         value.push_str("...");
     }
     value
@@ -2376,6 +2430,7 @@ fn level_for_score(score: f32) -> SimilarityLevel {
 mod tests {
     use super::*;
     use lopdf::dictionary;
+    use std::io::Read;
 
     fn test_doc(id: usize, images: Vec<PdfImage>) -> PdfDocumentData {
         PdfDocumentData {
@@ -2416,6 +2471,31 @@ mod tests {
             area: u64::from(width) * u64::from(height),
             sha256: [sha_byte; 32],
             phash,
+        }
+    }
+
+    fn test_pair(
+        left_file_id: &str,
+        left_file: &str,
+        right_file_id: &str,
+        right_file: &str,
+    ) -> SimilarityPair {
+        SimilarityPair {
+            pair_id: format!("pair-{left_file_id}-{right_file_id}"),
+            left_file_id: left_file_id.to_string(),
+            right_file_id: right_file_id.to_string(),
+            left_file: left_file.to_string(),
+            right_file: right_file.to_string(),
+            text_score: 0.9,
+            image_score: 0.0,
+            page_image_score: 0.0,
+            final_score: 0.9,
+            level: SimilarityLevel::Extreme,
+            exact_page_match_count: 0,
+            approximate_text_match_count: 1,
+            matched_text_chars: 100,
+            matched_texts: Vec::new(),
+            matched_images: Vec::new(),
         }
     }
 
@@ -2491,6 +2571,19 @@ mod tests {
     }
 
     #[test]
+    fn keeps_full_shingles_for_comparison_and_bottom_k_for_indexing() {
+        let text = (0..400)
+            .map(|offset| char::from_u32(0x4e00 + offset).unwrap())
+            .collect::<String>();
+        let full = shingles(&text, 3);
+        let sketch = minhash_sketch(&full);
+
+        assert!(full.len() > MAX_INDEX_SHINGLES_PER_CHUNK);
+        assert_eq!(sketch.len(), MAX_INDEX_SHINGLES_PER_CHUNK);
+        assert_eq!(sketch, full[..MAX_INDEX_SHINGLES_PER_CHUNK]);
+    }
+
+    #[test]
     fn filters_weak_single_chunk_candidates() {
         let raw_scores = HashMap::from([((0, 1), 1.0)]);
         let chunk_pairs = HashMap::from([((0, 0, 1, 0), MIN_SHARED_SHINGLES)]);
@@ -2532,6 +2625,23 @@ mod tests {
         add_coverage(&mut coverage, 2, 10, 30);
 
         assert_eq!(covered_chars(&coverage), 180);
+    }
+
+    #[test]
+    fn groups_same_named_files_by_id() {
+        let pairs = vec![
+            test_pair("file-0", "report.pdf", "file-1", "report.pdf"),
+            test_pair("file-1", "report.pdf", "file-2", "appendix.pdf"),
+        ];
+
+        let groups = build_groups(&pairs, &AnalyzeRequest::default());
+
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].file_ids, vec!["file-0", "file-1", "file-2"]);
+        assert_eq!(
+            groups[0].files,
+            vec!["report.pdf", "report.pdf", "appendix.pdf"]
+        );
     }
 
     #[test]
@@ -2644,6 +2754,7 @@ mod tests {
                 ..AnalyzeRequest::default()
             },
             format!("image-test-{}", uuid::Uuid::new_v4()),
+            &temp_dir.join("reports"),
             |_| {},
             || false,
         );
@@ -2656,9 +2767,45 @@ mod tests {
         assert_eq!(result.pairs[0].matched_images.len(), 1);
         assert_eq!(result.groups.len(), 1);
 
-        if let Some(report_path) = result.report_path {
-            let _ = fs::remove_file(report_path);
-        }
+        let report_path = result.report_path.as_ref().unwrap();
+        let automatic_json = fs::read_to_string(report_path).unwrap();
+        assert!(!automatic_json.contains(&temp_dir.to_string_lossy().to_string()));
+
+        let export_dir = temp_dir.join("export");
+        let exported = export_report(
+            &result,
+            &ExportReportRequest {
+                task_id: result.task_id.clone(),
+                target_dir: export_dir.to_string_lossy().to_string(),
+                export_json: true,
+                export_word: true,
+                include_text_evidence: true,
+            },
+        )
+        .unwrap();
+        let exported_json = exported
+            .exported_files
+            .iter()
+            .find(|path| path.ends_with(".json"))
+            .unwrap();
+        assert!(!fs::read_to_string(exported_json)
+            .unwrap()
+            .contains(&temp_dir.to_string_lossy().to_string()));
+
+        let exported_docx = exported
+            .exported_files
+            .iter()
+            .find(|path| path.ends_with(".docx"))
+            .unwrap();
+        let mut archive = zip::ZipArchive::new(fs::File::open(exported_docx).unwrap()).unwrap();
+        let mut relationships = String::new();
+        archive
+            .by_name("word/_rels/document.xml.rels")
+            .unwrap()
+            .read_to_string(&mut relationships)
+            .unwrap();
+        assert!(relationships.contains("/relationships/styles"));
+
         let _ = fs::remove_dir_all(temp_dir);
     }
 }

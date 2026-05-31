@@ -34,6 +34,7 @@ fn main() {
     let result = run_analysis(
         request,
         "demo".to_string(),
+        Path::new("analysis_results"),
         |progress| {
             println!(
                 "[{:?}] {} | {}/{} 页 | 候选 {} | 确认 {}",

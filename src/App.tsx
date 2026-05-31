@@ -18,6 +18,7 @@ type AnalysisStage =
   | "Init"
   | "ReadingMeta"
   | "BuildingTextIndex"
+  | "RecallingCandidates"
   | "ComparingText"
   | "GeneratingReport"
   | "Done"
@@ -79,13 +80,15 @@ type MatchedImage = {
 
 type SimilarityPair = {
   pair_id: string;
+  left_file_id: string;
+  right_file_id: string;
   left_file: string;
   right_file: string;
   text_score: number;
   image_score: number;
   page_image_score: number;
   final_score: number;
-  level: string;
+  level: SimilarityLevel;
   exact_page_match_count: number;
   approximate_text_match_count: number;
   matched_text_chars: number;
@@ -94,6 +97,8 @@ type SimilarityPair = {
 };
 
 type PairRelation = {
+  left_file_id: string;
+  right_file_id: string;
   left_file: string;
   right_file: string;
   final_score: number;
@@ -104,11 +109,12 @@ type PairRelation = {
 
 type SimilarityGroup = {
   group_id: string;
+  file_ids: string[];
   files: string[];
   group_score: number;
-  level: string;
+  level: SimilarityLevel;
   graph_density: number;
-  quality_flags: string[];
+  quality_flags: GroupQualityFlag[];
   pair_relations: PairRelation[];
 };
 
@@ -144,6 +150,9 @@ type AnalyzeRequest = AnalysisConfig & { paths: string[] };
 type ExportReportResult = {
   exported_files: string[];
 };
+
+type SimilarityLevel = "Extreme" | "High" | "Medium" | "Low";
+type GroupQualityFlag = "WeakConnection" | "NeedsManualReview";
 
 const analysisPresets: Record<string, AnalysisConfig> = {
   fast: {
@@ -196,6 +205,7 @@ const analysisPresets: Record<string, AnalysisConfig> = {
 const stageOrder: AnalysisStage[] = [
   "ReadingMeta",
   "BuildingTextIndex",
+  "RecallingCandidates",
   "ComparingText",
   "GeneratingReport",
 ];
@@ -204,6 +214,7 @@ const stageLabels: Record<AnalysisStage, string> = {
   Init: "等待任务",
   ReadingMeta: "快速扫描",
   BuildingTextIndex: "全局索引",
+  RecallingCandidates: "候选召回",
   ComparingText: "候选精算",
   GeneratingReport: "图聚类",
   Done: "分析完成",
@@ -248,15 +259,17 @@ function percent(progress?: AnalysisProgress | null) {
   const stageBonus =
     progress.stage === "BuildingTextIndex"
       ? 0.08
-      : progress.stage === "ComparingText"
-        ? 0.14
-        : progress.stage === "GeneratingReport"
-          ? 0.18
-          : 0;
+      : progress.stage === "RecallingCandidates"
+        ? 0.11
+        : progress.stage === "ComparingText"
+          ? 0.14
+          : progress.stage === "GeneratingReport"
+            ? 0.18
+            : 0;
   return Math.min(99, Math.round(pageProgress * 82 + stageBonus * 100));
 }
 
-function levelLabel(level: string) {
+function levelLabel(level: SimilarityLevel) {
   return (
     {
       Extreme: "极高",
@@ -283,7 +296,8 @@ function activePipelineStep(progress?: AnalysisProgress | null) {
   if (!progress) return 0;
   if (progress.stage === "Done") return 5;
   if (progress.stage === "ReadingMeta") return 1;
-  if (progress.stage === "BuildingTextIndex") return 3;
+  if (progress.stage === "BuildingTextIndex") return 2;
+  if (progress.stage === "RecallingCandidates") return 3;
   if (progress.stage === "ComparingText") return 4;
   if (progress.stage === "GeneratingReport") return 5;
   return 0;
@@ -323,7 +337,8 @@ export function App() {
             .map((relation) =>
               (result?.pairs ?? []).find(
                 (pair) =>
-                  pair.left_file === relation.left_file && pair.right_file === relation.right_file,
+                  pair.left_file_id === relation.left_file_id &&
+                  pair.right_file_id === relation.right_file_id,
               ),
             )
             .filter((pair): pair is SimilarityPair => Boolean(pair))
@@ -346,21 +361,28 @@ export function App() {
 
   useEffect(() => {
     if (!taskId || !isRunning) return;
+    let disposed = false;
     const timer = window.setInterval(async () => {
       try {
         const next = await invoke<AnalysisProgress>("get_analysis_progress", { taskId });
+        if (disposed) return;
         setProgress(next);
         if (["Done", "Cancelled", "Failed"].includes(next.stage)) {
           const finalResult = await invoke<AnalysisResult>("get_analysis_result", { taskId });
+          if (disposed) return;
           setResult(finalResult);
           setSelectedGroupId(finalResult.groups[0]?.group_id ?? null);
           setSelectedPairId(finalResult.pairs[0]?.pair_id ?? null);
         }
       } catch (cause) {
+        if (disposed) return;
         setError(String(cause));
       }
     }, 800);
-    return () => window.clearInterval(timer);
+    return () => {
+      disposed = true;
+      window.clearInterval(timer);
+    };
   }, [taskId, isRunning]);
 
   async function selectFiles() {
@@ -403,8 +425,12 @@ export function App() {
 
   async function cancel() {
     if (!taskId) return;
-    await invoke("cancel_analysis_task", { taskId });
-    setProgress(await invoke<AnalysisProgress>("get_analysis_progress", { taskId }));
+    try {
+      await invoke("cancel_analysis_task", { taskId });
+      setProgress(await invoke<AnalysisProgress>("get_analysis_progress", { taskId }));
+    } catch (cause) {
+      setError(String(cause));
+    }
   }
 
   function applyPreset(profile: keyof typeof analysisPresets) {
@@ -423,7 +449,7 @@ export function App() {
     setExportMessage(null);
     try {
       const directory = await open({ directory: true, multiple: false, title: "选择报告导出目录" });
-      if (!directory || Array.isArray(directory)) return;
+      if (!directory) return;
       const exported = await invoke<ExportReportResult>("export_analysis_report", {
         request: {
           task_id: result.task_id,
@@ -569,10 +595,10 @@ export function App() {
           <RailHeading title="导入文件" action={`${paths.length} 个 PDF`} />
           <section className="file-stack">
             {paths.length === 0 && <Empty copy="导入 PDF 后显示文件状态。" />}
-            {paths.map((path, index) => {
+            {paths.map((path) => {
               const file = files.find((item) => item.path === path);
               return (
-                <article className={`file-card ${index === 0 ? "selected" : ""}`} key={path}>
+                <article className="file-card" key={path}>
                   <div className="file-title">
                     <strong>{file?.file_name ?? basename(path)}</strong>
                     <span className={`mini-status ${file?.status === "failed" ? "red" : ""}`}>
@@ -660,8 +686,8 @@ export function App() {
                                 sum +
                                 (sortedPairs.find(
                                   (pair) =>
-                                    pair.left_file === relation.left_file &&
-                                    pair.right_file === relation.right_file,
+                                    pair.left_file_id === relation.left_file_id &&
+                                    pair.right_file_id === relation.right_file_id,
                                 )?.exact_page_match_count ?? 0),
                               0,
                             ),
@@ -942,13 +968,13 @@ function GroupGraph({ group }: { group?: SimilarityGroup }) {
         </div>
       </div>
       <div className="member-tile-grid">
-        {group.files.map((file) => (
-          <div className="member-tile" title={file} key={file}>{compactName(file, 12)}</div>
+        {group.files.map((file, index) => (
+          <div className="member-tile" title={file} key={group.file_ids[index]}>{compactName(file, 12)}</div>
         ))}
       </div>
       <div className="relation-tile-grid">
         {group.pair_relations.map((relation) => (
-          <div className="relation-tile" key={`${relation.left_file}-${relation.right_file}`}>
+          <div className="relation-tile" key={`${relation.left_file_id}-${relation.right_file_id}`}>
             <span title={relation.left_file}>{compactName(relation.left_file, 8)}</span>
             <b>↔</b>
             <span title={relation.right_file}>{compactName(relation.right_file, 8)}</span>

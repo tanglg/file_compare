@@ -8,13 +8,18 @@ use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
+use tauri::Manager;
 use uuid::Uuid;
+
+const MAX_RETAINED_COMPLETED_TASKS: usize = 20;
 
 #[derive(Clone)]
 struct TaskRecord {
     progress: AnalysisProgress,
     result: Option<AnalysisResult>,
     cancel_requested: bool,
+    created_at: Instant,
 }
 
 #[derive(Default)]
@@ -31,6 +36,7 @@ impl TaskManager {
                 progress,
                 result: None,
                 cancel_requested: false,
+                created_at: Instant::now(),
             },
         );
     }
@@ -42,7 +48,8 @@ impl TaskManager {
     }
 
     fn finish(&self, task_id: &str, result: AnalysisResult) {
-        if let Some(task) = self.tasks.lock().get_mut(task_id) {
+        let mut tasks = self.tasks.lock();
+        if let Some(task) = tasks.get_mut(task_id) {
             task.progress = AnalysisProgress {
                 stage: if task.cancel_requested {
                     AnalysisStage::Cancelled
@@ -58,13 +65,16 @@ impl TaskManager {
             };
             task.result = Some(result);
         }
+        Self::prune_completed(&mut tasks);
     }
 
     fn fail(&self, task_id: &str, reason: String) {
-        if let Some(task) = self.tasks.lock().get_mut(task_id) {
+        let mut tasks = self.tasks.lock();
+        if let Some(task) = tasks.get_mut(task_id) {
             task.progress.stage = AnalysisStage::Failed;
             task.progress.message = reason;
         }
+        Self::prune_completed(&mut tasks);
     }
 
     fn cancel(&self, task_id: &str) {
@@ -95,13 +105,36 @@ impl TaskManager {
             .get(task_id)
             .and_then(|task| task.result.clone())
     }
+
+    fn prune_completed(tasks: &mut HashMap<String, TaskRecord>) {
+        let mut completed = tasks
+            .iter()
+            .filter(|(_, task)| {
+                matches!(
+                    task.progress.stage,
+                    AnalysisStage::Done | AnalysisStage::Cancelled | AnalysisStage::Failed
+                )
+            })
+            .map(|(task_id, task)| (task_id.clone(), task.created_at))
+            .collect::<Vec<_>>();
+        completed.sort_by_key(|(_, created_at)| *created_at);
+        let remove_count = completed.len().saturating_sub(MAX_RETAINED_COMPLETED_TASKS);
+        for (task_id, _) in completed.into_iter().take(remove_count) {
+            tasks.remove(&task_id);
+        }
+    }
 }
 
 static TASKS: Lazy<Arc<TaskManager>> = Lazy::new(|| Arc::new(TaskManager::default()));
 
 #[tauri::command]
-fn create_analysis_task(request: AnalyzeRequest) -> Result<String, String> {
+fn create_analysis_task(app: tauri::AppHandle, request: AnalyzeRequest) -> Result<String, String> {
     request.validate()?;
+    let report_dir = app
+        .path()
+        .app_local_data_dir()
+        .map_err(|error| format!("无法定位应用数据目录: {error}"))?
+        .join("analysis_results");
 
     let task_id = Uuid::new_v4().to_string();
     TASKS.create(task_id.clone(), request.paths.len());
@@ -114,6 +147,7 @@ fn create_analysis_task(request: AnalyzeRequest) -> Result<String, String> {
             analysis::run_analysis(
                 request,
                 run_task_id.clone(),
+                &report_dir,
                 move |progress| TASKS.update_progress(&progress_task_id, progress),
                 move || TASKS.is_cancelled(&cancel_task_id),
             )
@@ -168,4 +202,38 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("failed to run Tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn task_record(task_id: &str, stage: AnalysisStage) -> TaskRecord {
+        let mut progress = AnalysisProgress::new(task_id.to_string(), 2);
+        progress.stage = stage;
+        TaskRecord {
+            progress,
+            result: None,
+            cancel_requested: false,
+            created_at: Instant::now(),
+        }
+    }
+
+    #[test]
+    fn prunes_old_completed_tasks_but_keeps_active_tasks() {
+        let mut tasks = HashMap::new();
+        for index in 0..(MAX_RETAINED_COMPLETED_TASKS + 3) {
+            let task_id = format!("done-{index}");
+            tasks.insert(task_id.clone(), task_record(&task_id, AnalysisStage::Done));
+        }
+        tasks.insert(
+            "active".to_string(),
+            task_record("active", AnalysisStage::ComparingText),
+        );
+
+        TaskManager::prune_completed(&mut tasks);
+
+        assert_eq!(tasks.len(), MAX_RETAINED_COMPLETED_TASKS + 1);
+        assert!(tasks.contains_key("active"));
+    }
 }
