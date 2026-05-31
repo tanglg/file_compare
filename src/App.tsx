@@ -154,7 +154,7 @@ type ExportReportResult = {
 type SimilarityLevel = "Extreme" | "High" | "Medium" | "Low";
 type GroupQualityFlag = "WeakConnection" | "NeedsManualReview";
 
-const analysisPresets: Record<string, AnalysisConfig> = {
+const analysisPresets = {
   fast: {
     analysis_depth: "fast",
     text_threshold: 0.78,
@@ -199,6 +199,53 @@ const analysisPresets: Record<string, AnalysisConfig> = {
     candidate_score_threshold: 0.24,
     candidate_top_k_per_file: 36,
     max_matches_per_pair: 60,
+  },
+  exhaustive: {
+    analysis_depth: "exhaustive",
+    text_threshold: 0.62,
+    image_threshold: 0.78,
+    final_threshold: 0.4,
+    min_chunk_chars: 40,
+    target_chunk_chars: 320,
+    chunk_overlap_chars: 160,
+    shingle_size: 3,
+    min_shared_shingles: 1,
+    simhash_hamming_threshold: 8,
+    candidate_score_threshold: 0.16,
+    candidate_top_k_per_file: 64,
+    max_matches_per_pair: 100,
+  },
+} satisfies Record<string, AnalysisConfig>;
+
+type AnalysisPreset = keyof typeof analysisPresets;
+
+const analysisPresetDetails: Record<
+  AnalysisPreset,
+  { label: string; tag: string; description: string; recommendation: string }
+> = {
+  fast: {
+    label: "快速",
+    tag: "初步筛查",
+    description: "减少候选数量，优先确认明显重复内容。",
+    recommendation: "适合文件较多、先快速摸底；可能略过弱关联或局部改写。",
+  },
+  balanced: {
+    label: "均衡",
+    tag: "默认推荐",
+    description: "在召回范围、证据数量和执行耗时之间取平衡。",
+    recommendation: "适合日常检测，通常先用这一档。",
+  },
+  deep: {
+    label: "深度",
+    tag: "加强召回",
+    description: "切块更细、重叠更多，并保留更多候选和证据。",
+    recommendation: "适合复核重点批次，耗时会明显增加。",
+  },
+  exhaustive: {
+    label: "穷尽",
+    tag: "最深检查",
+    description: "进一步放宽召回条件，尽量发现零散复用和较弱相似。",
+    recommendation: "适合最终审查；耗时最高，也会产生更多需人工确认的弱候选。",
   },
 };
 
@@ -439,6 +486,11 @@ export function App() {
     setFinalThreshold(next.final_threshold);
   }
 
+  function updateAnalysisConfig(patch: Partial<AnalysisConfig>) {
+    setAnalysisConfig((current) => ({ ...current, ...patch, analysis_depth: "custom" }));
+    if (patch.final_threshold !== undefined) setFinalThreshold(patch.final_threshold);
+  }
+
   async function exportReport() {
     if (!result) return;
     if (!exportWord && !exportJson) {
@@ -529,30 +581,46 @@ export function App() {
               </button>
             </div>
             <div className="depth-tabs">
-              {(["fast", "balanced", "deep"] as const).map((profile) => (
+              {(Object.keys(analysisPresets) as AnalysisPreset[]).map((profile) => (
                 <button
                   className={analysisConfig.analysis_depth === profile ? "active" : ""}
                   key={profile}
                   onClick={() => applyPreset(profile)}
                 >
-                  {profile === "fast" ? "快速" : profile === "balanced" ? "均衡" : "深度"}
+                  <strong>{analysisPresetDetails[profile].label}</strong>
+                  <span>{analysisPresetDetails[profile].tag}</span>
                 </button>
               ))}
             </div>
+            <div className="depth-advice">
+              {analysisConfig.analysis_depth === "custom" ? (
+                <>
+                  <strong>自定义参数</strong>
+                  <p>你已手动调整预设。阈值越低、切块越细、重叠和候选上限越高，检查越深入，但耗时和待复核候选也会增加。</p>
+                </>
+              ) : (
+                <>
+                  <strong>{analysisPresetDetails[analysisConfig.analysis_depth as AnalysisPreset].description}</strong>
+                  <p>{analysisPresetDetails[analysisConfig.analysis_depth as AnalysisPreset].recommendation}</p>
+                </>
+              )}
+            </div>
             <div className="settings-grid">
-              <ParameterInput label="文本确认阈值" value={analysisConfig.text_threshold} step={0.01} min={0.4} max={0.95} onChange={(value) => setAnalysisConfig({ ...analysisConfig, text_threshold: value })} />
-              <ParameterInput label="图片确认阈值" value={analysisConfig.image_threshold} step={0.01} min={0.6} max={0.95} onChange={(value) => setAnalysisConfig({ ...analysisConfig, image_threshold: value })} />
-              <ParameterInput label="成组阈值" value={finalThreshold} step={0.01} min={0.3} max={0.95} onChange={(value) => setFinalThreshold(value)} />
-              <ParameterInput label="目标块长度" value={analysisConfig.target_chunk_chars} step={20} min={200} max={1000} onChange={(value) => setAnalysisConfig({ ...analysisConfig, target_chunk_chars: value })} />
-              <ParameterInput label="块重叠字符" value={analysisConfig.chunk_overlap_chars} step={10} min={20} max={300} onChange={(value) => setAnalysisConfig({ ...analysisConfig, chunk_overlap_chars: value })} />
-              <ParameterInput label="shingle 粒度" value={analysisConfig.shingle_size} step={1} min={3} max={12} onChange={(value) => setAnalysisConfig({ ...analysisConfig, shingle_size: value })} />
-              <ParameterInput label="共享 shingle 下限" value={analysisConfig.min_shared_shingles} step={1} min={1} max={20} onChange={(value) => setAnalysisConfig({ ...analysisConfig, min_shared_shingles: value })} />
-              <ParameterInput label="SimHash 容差" value={analysisConfig.simhash_hamming_threshold} step={1} min={0} max={16} onChange={(value) => setAnalysisConfig({ ...analysisConfig, simhash_hamming_threshold: value })} />
-              <ParameterInput label="每文件候选上限" value={analysisConfig.candidate_top_k_per_file} step={1} min={4} max={100} onChange={(value) => setAnalysisConfig({ ...analysisConfig, candidate_top_k_per_file: value })} />
-              <ParameterInput label="每对证据上限" value={analysisConfig.max_matches_per_pair} step={5} min={5} max={200} onChange={(value) => setAnalysisConfig({ ...analysisConfig, max_matches_per_pair: value })} />
+              <ParameterInput label="文本确认阈值" description="两段文字达到多像才算匹配。越低越容易发现改写内容。" value={analysisConfig.text_threshold} step={0.01} min={0.4} max={0.95} onChange={(value) => updateAnalysisConfig({ text_threshold: value })} />
+              <ParameterInput label="图片确认阈值" description="两张图片达到多像才算匹配。越低越容易识别压缩或缩放图片。" value={analysisConfig.image_threshold} step={0.01} min={0.6} max={0.95} onChange={(value) => updateAnalysisConfig({ image_threshold: value })} />
+              <ParameterInput label="成组阈值" description="文件综合分达到多少才进入雷同组。越低会显示更多弱关联。" value={finalThreshold} step={0.01} min={0.3} max={0.95} onChange={(value) => updateAnalysisConfig({ final_threshold: value })} />
+              <ParameterInput label="最小块长度" description="短于多少字的文本块会被忽略。越小越容易发现零散复制。" value={analysisConfig.min_chunk_chars} step={10} min={30} max={500} onChange={(value) => updateAnalysisConfig({ min_chunk_chars: value })} />
+              <ParameterInput label="目标块长度" description="每段文字大约切成多少字来比较。越小检查越细。" value={analysisConfig.target_chunk_chars} step={20} min={200} max={1000} onChange={(value) => updateAnalysisConfig({ target_chunk_chars: value })} />
+              <ParameterInput label="块重叠字符" description="相邻文本块重复保留的字数，避免相似内容刚好被切断。" value={analysisConfig.chunk_overlap_chars} step={10} min={20} max={300} onChange={(value) => updateAnalysisConfig({ chunk_overlap_chars: value })} />
+              <ParameterInput label="shingle 粒度" description="连续几个字组成一个文本指纹。越小越敏感，也更容易误报。" value={analysisConfig.shingle_size} step={1} min={3} max={12} onChange={(value) => updateAnalysisConfig({ shingle_size: value })} />
+              <ParameterInput label="共享 shingle 下限" description="至少共享多少个文本指纹，才进入下一轮检查。越小召回越多。" value={analysisConfig.min_shared_shingles} step={1} min={1} max={20} onChange={(value) => updateAnalysisConfig({ min_shared_shingles: value })} />
+              <ParameterInput label="SimHash 容差" description="允许文本摘要指纹相差多少位。越大越能容忍改写。" value={analysisConfig.simhash_hamming_threshold} step={1} min={0} max={16} onChange={(value) => updateAnalysisConfig({ simhash_hamming_threshold: value })} />
+              <ParameterInput label="候选召回阈值" description="初筛分达到多少才深入比较。越低漏检更少，但耗时更长。" value={analysisConfig.candidate_score_threshold} step={0.01} min={0.05} max={0.8} onChange={(value) => updateAnalysisConfig({ candidate_score_threshold: value })} />
+              <ParameterInput label="每文件候选上限" description="每份文件最多与多少份其他文件深入比较。越高检查越全面。" value={analysisConfig.candidate_top_k_per_file} step={1} min={4} max={100} onChange={(value) => updateAnalysisConfig({ candidate_top_k_per_file: value })} />
+              <ParameterInput label="每对证据上限" description="每对文件最多保留多少条匹配证据。越高报告越完整。" value={analysisConfig.max_matches_per_pair} step={5} min={5} max={200} onChange={(value) => updateAnalysisConfig({ max_matches_per_pair: value })} />
             </div>
             <div className="settings-foot">
-              <span>当前模式：{analysisConfig.analysis_depth === "deep" ? "深度分析" : analysisConfig.analysis_depth === "fast" ? "快速筛查" : "均衡检测"}</span>
+              <span>当前模式：{analysisConfig.analysis_depth === "custom" ? "自定义参数" : analysisPresetDetails[analysisConfig.analysis_depth as AnalysisPreset].label}</span>
               <button className="button primary" onClick={() => setSettingsOpen(false)}>
                 <Check size={15} />
                 应用参数
@@ -925,6 +993,7 @@ function Empty({ copy }: { copy: string }) {
 
 function ParameterInput({
   label,
+  description,
   value,
   step,
   min,
@@ -932,6 +1001,7 @@ function ParameterInput({
   onChange,
 }: {
   label: string;
+  description: string;
   value: number;
   step: number;
   min: number;
@@ -949,6 +1019,7 @@ function ParameterInput({
         step={step}
         onChange={(event) => onChange(Number(event.target.value))}
       />
+      <small>{description}</small>
     </label>
   );
 }
